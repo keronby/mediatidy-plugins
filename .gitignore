@@ -1,0 +1,25 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 打包临时目录与产物
+.pack_*/
+dist/
+*.zip
+*.tar.gz
+
+# 临时排查脚本与存档
+apply_fix.py
+fix.sh
+_archive/
+接手指令.md
+
+# 系统环境与日志
+.DS_Store
+*.log
+.env
+.venv
+env/
+venv/

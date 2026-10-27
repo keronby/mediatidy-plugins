@@ -1,0 +1,12 @@
+[project]
+name = "media-dup-scan"
+version = "1.0.0"
+description = "媒体查重：在单个作品目录内找出重复媒体，按 MT 评分规则判定应保留的版本（只读）"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.mt-plugin]
+include = ["plugin.py", "plugin.json", "pyproject.toml", "uv.lock", "core", "ui"]

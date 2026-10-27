@@ -1,0 +1,314 @@
+{
+  "version": "2",
+  "maxNodes": 500,
+  "maxDepth": 12,
+  "components": {
+    "Page": {
+      "title": "value",
+      "description": "value",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Section": {
+      "title": "value",
+      "description": "value",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Stack": {
+      "direction": "direction",
+      "gap": "gap",
+      "align": "align",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Grid": {
+      "columns": "columns",
+      "gap": "gap",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Card": {
+      "title": "value",
+      "description": "value",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Text": {
+      "text": "value",
+      "tone": "tone",
+      "size": "size",
+      "format": "format",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Markdown": {
+      "text": "value",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Icon": {
+      "name": "text",
+      "tone": "tone",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Image": {
+      "src": "value",
+      "alt": "text",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Badge": {
+      "text": "value",
+      "tone": "tone",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Alert": {
+      "text": "value",
+      "tone": "tone",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Divider": {
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Details": {
+      "label": "value",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Input": {
+      "label": "value",
+      "bind": "editable",
+      "placeholder": "text",
+      "type": "inputType",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Textarea": {
+      "label": "value",
+      "bind": "editable",
+      "placeholder": "text",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Select": {
+      "label": "value",
+      "bind": "editable",
+      "options": "value",
+      "multiple": "boolean",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Checkbox": {
+      "label": "value",
+      "bind": "editable",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "FilePicker": {
+      "visible": "value",
+      "disabled": "value"
+    },
+    "ProfilePicker": {
+      "label": "value",
+      "bind": "editable",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Progress": {
+      "label": "value",
+      "value": "value",
+      "total": "value",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Steps": {
+      "labels": "value",
+      "value": "value",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Metric": {
+      "label": "value",
+      "value": "value",
+      "tone": "tone",
+      "onClick": "events",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Button": {
+      "label": "value",
+      "onClick": "events",
+      "variant": "variant",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Repeat": {
+      "source": "value",
+      "rowKey": "text",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Table": {
+      "source": "value",
+      "columns": "tableColumns",
+      "selectionBind": "editable",
+      "rowKey": "text",
+      "pageSize": "pageSize",
+      "searchable": "boolean",
+      "sortable": "boolean",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Tabs": {
+      "bind": "editable",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Tab": {
+      "id": "text",
+      "label": "text",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Dialog": {
+      "bind": "editable",
+      "title": "value",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "Drawer": {
+      "bind": "editable",
+      "title": "value",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "EmptyState": {
+      "title": "value",
+      "description": "value",
+      "visible": "value",
+      "disabled": "value"
+    },
+    "DraftReview": {
+      "visible": "value",
+      "disabled": "value"
+    },
+    "RunHistory": {
+      "visible": "value",
+      "disabled": "value"
+    },
+    "ConfigForm": {
+      "visible": "value",
+      "disabled": "value"
+    },
+    "ScheduleForm": {
+      "visible": "value",
+      "disabled": "value"
+    },
+    "EventSubscriptions": {
+      "visible": "value",
+      "disabled": "value"
+    },
+    "RunLog": {
+      "visible": "value",
+      "disabled": "value"
+    },
+    "TaskList": {
+      "visible": "value",
+      "disabled": "value"
+    },
+    "DataManagement": {
+      "visible": "value",
+      "disabled": "value"
+    }
+  },
+  "enums": {
+    "direction": [
+      "row",
+      "column"
+    ],
+    "gap": [
+      "none",
+      "sm",
+      "md",
+      "lg"
+    ],
+    "align": [
+      "start",
+      "center",
+      "end",
+      "stretch"
+    ],
+    "columns": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "tone": [
+      "default",
+      "muted",
+      "primary",
+      "success",
+      "warning",
+      "danger"
+    ],
+    "size": [
+      "sm",
+      "md",
+      "lg",
+      "xl"
+    ],
+    "format": [
+      "text",
+      "datetime",
+      "json"
+    ],
+    "inputType": [
+      "text",
+      "number"
+    ],
+    "variant": [
+      "default",
+      "outline",
+      "secondary",
+      "ghost",
+      "destructive"
+    ],
+    "pageSize": [
+      10,
+      20,
+      50,
+      100
+    ]
+  },
+  "operations": [
+    "eq",
+    "ne",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "and",
+    "or",
+    "not",
+    "if",
+    "coalesce",
+    "concat",
+    "length",
+    "includes"
+  ],
+  "hostActions": [
+    "saveConfig",
+    "refreshRun",
+    "cancelRun",
+    "newRun",
+    "openLogs",
+    "reviewDrafts",
+    "refreshPage"
+  ]
+}

@@ -1,0 +1,234 @@
+{
+  "id": "media.dup-scan",
+  "name": "媒体查重",
+  "version": "1.0.0",
+  "sdkVersion": "2",
+  "entry": "plugin.py:Plugin",
+  "description": "扫描媒体库目录，根据本地路径与分享路径自动适配 MT 评分规则找出同一作品内重复的 strm 或媒体文件，报告应保留与应删除的版本。只读，不删除任何文件。",
+  "author": "keronby",
+  "permissions": [
+    "files.read",
+    "storage",
+    "rules.read",
+    "organize.read",
+    "tasks.read",
+    "tasks.wait"
+  ],
+  "config": [
+    {
+      "key": "localProfileId",
+      "label": "本地路径整理方案 ID（留空自动使用授权方案）",
+      "type": "text",
+      "default": ""
+    },
+    {
+      "key": "shareProfileId",
+      "label": "分享/STRM 路径整理方案 ID（留空自动使用授权方案）",
+      "type": "text",
+      "default": ""
+    },
+    {
+      "key": "sharePathKeywords",
+      "label": "分享路径识别关键字（逗号分隔）",
+      "type": "text",
+      "default": "strm,云盘"
+    },
+    {
+      "key": "minScoreDiff",
+      "label": "最小分差门槛（留 0 跟随 MT 规则）",
+      "type": "number",
+      "default": 0
+    },
+    {
+      "key": "ignorePaths",
+      "label": "屏蔽路径（每行一个，绝对或相对授权根）",
+      "type": "textarea",
+      "default": ""
+    },
+    {
+      "key": "showTie",
+      "label": "显示分差不足的组",
+      "type": "boolean",
+      "default": true
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "localProfileId": { "type": "string", "maxLength": 40 },
+      "shareProfileId": { "type": "string", "maxLength": 40 },
+      "sharePathKeywords": { "type": "string", "maxLength": 200 },
+      "minScoreDiff": { "type": "number", "minimum": 0, "maximum": 1000 },
+      "ignorePaths": { "type": "string", "maxLength": 8000 },
+      "showTie": { "type": "boolean" }
+    },
+    "additionalProperties": true
+  },
+  "actions": [
+    {
+      "id": "dup-scan",
+      "label": "开始扫描",
+      "fields": [
+        {
+          "key": "dirs",
+          "label": "要扫描的目录",
+          "type": "files",
+          "required": true
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dirs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "dup-clear",
+      "label": "清空结果",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "save-rules",
+      "label": "保存方案与规则配置",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "manual-decide",
+      "label": "人工选择保留版本",
+      "fields": [
+        {
+          "key": "groupId",
+          "label": "重复组 ID",
+          "type": "text",
+          "required": true
+        },
+        {
+          "key": "keepRel",
+          "label": "选定保留的相对路径",
+          "type": "text",
+          "required": true
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "groupId": {
+            "type": "string"
+          },
+          "keepRel": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "groupId",
+          "keepRel"
+        ],
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "dup-collect",
+      "label": "收集扫描结果",
+      "kind": "continuation",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "summary",
+      "label": "扫描概览",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "rules",
+      "label": "当前评分规则",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    }
+  ],
+  "ui": {
+    "mode": "python",
+    "version": "2",
+    "entry": "",
+    "icon": "ui/icon.png"
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "localProfileId": {
+        "type": "string",
+        "maxLength": 40
+      },
+      "shareProfileId": {
+        "type": "string",
+        "maxLength": 40
+      },
+      "sharePathKeywords": {
+        "type": "string",
+        "maxLength": 200
+      },
+      "minScoreDiff": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1000
+      },
+      "ignorePaths": {
+        "type": "string",
+        "maxLength": 8000
+      },
+      "showTie": {
+        "type": "boolean"
+      }
+    }
+  }
+}

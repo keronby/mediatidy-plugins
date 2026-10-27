@@ -1,0 +1,19 @@
+[project]
+name = "media.series-dedup"
+version = "1.0.0"
+description = "剧集查重（影视目录重整分流）"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.mt-plugin]
+include = [
+  "plugin.py",
+  "plugin.json",
+  "pyproject.toml",
+  "uv.lock",
+  "core",
+  "ui"
+]

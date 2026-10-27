@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mt-plugin"
+version = "2.0.0"
+description = "MediaTidy trusted Python plugin SDK"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["mypy==1.19.1"]
+
+[project.scripts]
+mt-plugin = "mt_plugin.pack:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mt_plugin"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+ignore_missing_imports = true

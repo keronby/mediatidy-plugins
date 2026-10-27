@@ -1,0 +1,194 @@
+{
+  "id": "media.series-dedup",
+  "name": "剧集查重（影视重整分流）",
+  "version": "1.0.0",
+  "sdkVersion": "2",
+  "author": "keronby",
+  "description": "按 TMDB ID 扫描电影/电视剧目录，比对 TMDB 最新标题/年份，按 STRM 链接属性（分享链/云盘链/混合链）自动分流重整任务。",
+  "entry": "plugin.py:Plugin",
+  "permissions": [
+    "files.read",
+    "storage",
+    "rules.read",
+    "organize.read",
+    "organize.run",
+    "tasks.read",
+    "tasks.wait"
+  ],
+  "config": [
+    {
+      "key": "debugMode",
+      "label": "调试模式（只读模拟，不实际提交整理）",
+      "type": "boolean",
+      "default": true
+    },
+    {
+      "key": "rootPath",
+      "label": "扫描根目录",
+      "type": "text",
+      "default": "/strm/云盘影视/电视剧"
+    },
+    {
+      "key": "localProfileId",
+      "label": "本地整理方案 ID（http分享链）",
+      "type": "text",
+      "default": "1359"
+    },
+    {
+      "key": "localDestDir",
+      "label": "本地整理目标目录",
+      "type": "text",
+      "default": "/strm/云盘影视"
+    },
+    {
+      "key": "cloudProfileId",
+      "label": "云盘整理方案 ID（cloudnas本地链）",
+      "type": "text",
+      "default": "854"
+    },
+    {
+      "key": "cloudDestDir",
+      "label": "云盘整理目标目录",
+      "type": "text",
+      "default": "/小小玻珠/云盘影视"
+    },
+    {
+      "key": "forceRefreshTmdb",
+      "label": "比对前强制刷新 TMDB 官方缓存",
+      "type": "boolean",
+      "default": true
+    }
+  ],
+  "actions": [
+    {
+      "id": "scan",
+      "label": "开始查重扫描",
+      "fields": [
+        {
+          "key": "scanPath",
+          "label": "扫描目录路径",
+          "type": "text",
+          "required": false
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scanPath": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "refresh-tmdb",
+      "label": "刷新 TMDB 缓存",
+      "fields": [],
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "submit-organize",
+      "label": "提交分流重整",
+      "fields": [
+        {
+          "key": "category",
+          "label": "分类类型",
+          "type": "text",
+          "required": false
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "category": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "stop",
+      "label": "停止任务",
+      "fields": [],
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "clear-history",
+      "label": "清空扫描记录",
+      "fields": [],
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "save-config",
+      "label": "保存分流配置",
+      "fields": [],
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "status",
+      "label": "运行状态与统计",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "profiles",
+      "label": "整理方案列表",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    }
+  ],
+  "ui": {
+    "mode": "python",
+    "version": "2",
+    "entry": "",
+    "icon": "ui/icon.png"
+  }
+}

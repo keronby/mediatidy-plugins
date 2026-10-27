@@ -1,0 +1,4 @@
+interface:
+  display_name: "MediaTidy Python 插件开发"
+  short_description: "按当前 Python SDK v2 编写插件、双模式页面、任务续接并验证打包"
+  default_prompt: "使用 $mediatidy-plugin-development，基于随包 SDK 和模板完成这个 MediaTidy 插件，核对目标宿主能力并验证打包结果。"
