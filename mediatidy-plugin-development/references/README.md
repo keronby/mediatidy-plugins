@@ -1,8 +1,12 @@
 # MediaTidy 插件 · Python SDK v2
 
+> 来源：MediaTidy 官方 Wiki · Python SDK v2 插件文档
+> 抓取日期：2026-11-03
+> 原文：https://murongyun8.github.io/MediaTidy-Wiki/plugins/
+
 MediaTidy 插件通过 Python 实现业务，使用宿主的文件、媒体、整理、STRM、AI、任务和存储能力。每个启用实例拥有常驻 Python 对象；页面可以由 Python 返回 MT UI 组件，也可以采用 React 模块联邦。
 
-本文对应当前仓库的 Python SDK `2.0.0`、`sdkVersion: "2"` 和 `ui.version: "2"`，核对日期为 2026-10-26。SDK 包版本不等于主应用版本；同为 v2 的旧 Goja 插件也不能直接运行在当前 Python 运行时。
+本文对应当前仓库的 Python SDK `2.0.0`、`sdkVersion: "2"` 和 `ui.version: "2"`。SDK 包版本不等于主应用版本；同为 v2 的旧 Goja 插件也不能直接运行在当前 Python 运行时。
 
 ## 从这里开始
 
@@ -13,8 +17,11 @@ MediaTidy 插件通过 Python 实现业务，使用宿主的文件、媒体、�
 | 编写第一个 Python 插件 | [快速开始](getting-started.md)、[清单与数据契约](manifest.md) |
 | 选择 Python 或 React 页面 | [双模式 UI](ui.md) |
 | 使用文件、整理、AI 等宿主能力 | [业务接口](business.md)、[能力清单](capabilities.md)、[权限](permissions.md) |
+| 读取 Emby 配置、查询或管理 Emby | [Emby 配置与通用 API](emby.md) |
+| 展示生成海报、跨动作上传图片 | [临时图片与预览](artifacts.md)、[Emby 海报示例](emby-poster.md) |
 | 后台任务、定时和完成回调 | [生命周期与续接](automation.md) |
 | 保存结果、查看日志、处理大量文件 | [存储](storage.md)、[日志](logs.md)、[工作流容量](workflow-capacity.md) |
+| 分键存储与表格行内操作 | [分键分页示例](storage-table.md) |
 | 理解 AI 识别整理示例 | [AI 工作流](ai-organize.md) |
 | 检查、打包、同步和验收 | [开发工具](tooling.md)、[验收与排错](validation.md)、[实现对应关系](implementation-status.md) |
 
@@ -29,3 +36,7 @@ MediaTidy 插件通过 Python 实现业务，使用宿主的文件、媒体、�
 ## 文档和契约来源
 
 主仓库 `backend/internal/plugins/contract/methods.json` 定义宿主方法，`plugin-ui-schema/registry.json` 定义组件。生成器维护 Python 客户端、运行时快照和能力表；`docs/plugins-sdk-v2/` 是正文来源，再同步到 SDK、Skill 和官方 Wiki。准确参数以同包 [methods.json](sdk/mt_plugin/methods.json) 为准。
+
+> **注意**：本目录文档已于 2026-11-03 全量下拉更新，但 `sdk/mt_plugin/methods.json` 与 `clients.py` 仍是旧版快照，
+> 尚未包含本轮新增的 `ffprobe.cache_exists`、`artifacts.publish/delete`、`emby.*` 等方法与文件对象的 `sha1` 字段。
+> 涉及这些新能力时，请以官方 Wiki 与宿主实际返回为准，并先用 `runtime.capabilities()` 探测可用性。

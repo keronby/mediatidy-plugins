@@ -28,7 +28,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from . import nameinfo, scoring
 
 # 作品目录判定：目录名里带 {tmdb-123} 或 [tmdbid=123]
-# 方括号与花括号两种都出现过（云盘影视用花括号，旧库 shareStrm 用方括号）
+# 方括号与花括号两种命名风格均兼容识别
 _RE_TMDB_DIR = re.compile(r'[\[{]\s*tmdb(?:id)?\s*[-=:]\s*(\d+)\s*[\]}]', re.I)
 
 

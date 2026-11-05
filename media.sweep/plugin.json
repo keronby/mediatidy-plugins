@@ -1,0 +1,777 @@
+{
+  "id": "media.sweep",
+  "name": "整理清道夫",
+  "version": "1.1.0",
+  "sdkVersion": "2",
+  "author": "keronby",
+  "description": "MT 整理后的清扫环节。分区①：用本地 sha1 归约库（MT FF 缓存 + 历史导入 + STRM 扫描 + 云盘媒体库，实测约 79.6 万条）比对云盘未识别目录，视频全部命中的作品视为已整理并整包删除，未命中的原地保留；分区②：把剩余文件交 AI 识别（原生搜索 → 公开资料搜索 → 纯文件名三级降级，任一不可用自动降级，绝不硬失败），识别成功后交 MT 整理。零第三方依赖。",
+  "entry": "plugin.py:Plugin",
+  "permissions": [
+    "files.read",
+    "files.delete",
+    "files.write",
+    "storage",
+    "triggers.manage",
+    "ai.chat",
+    "ai.web.search",
+    "tmdb.read",
+    "system.read",
+    "organize.read",
+    "organize.prepare",
+    "organize.submit",
+    "organize.manual.run",
+    "tasks.read",
+    "tasks.wait",
+    "tasks.cancel"
+  ],
+  "triggers": [
+    {
+      "key": "sha1-dedup-job",
+      "type": "schedule",
+      "action": "run-job"
+    }
+  ],
+  "config": [
+    {
+      "key": "prompt",
+      "label": "AI 识别提示词（留空用默认；决定 AI 如何识别作品）",
+      "type": "textarea",
+      "default": ""
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "prompt": {
+        "type": "string",
+        "maxLength": 20000
+      }
+    },
+    "additionalProperties": true
+  },
+  "actions": [
+    {
+      "id": "cleanup-all",
+      "label": "一键清理：比对删除 + 剩余交 AI 识别",
+      "fields": [
+        {
+          "key": "confirm",
+          "label": "确认真删（填 YES）",
+          "type": "text"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "confirm": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "probe-mt",
+      "label": "只读检测 MT 缓存",
+      "fields": [],
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "cloud-diag",
+      "label": "诊断云盘媒体库提取",
+      "fields": [
+        {
+          "key": "roots",
+          "label": "云盘目录（留空用已保存值）",
+          "type": "text"
+        },
+        {
+          "key": "cloudDepth",
+          "label": "最大层数",
+          "type": "number"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "roots": {
+            "type": "string"
+          },
+          "cloudDepth": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "cloud-probe",
+      "label": "裸调 files.list 探测单个路径",
+      "fields": [
+        {
+          "key": "path",
+          "label": "云盘绝对路径",
+          "type": "text"
+        },
+        {
+          "key": "quotaTest",
+          "label": "配额探测次数",
+          "type": "number"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "quotaTest": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "refresh-lib",
+      "label": "增量同步 sha1 库",
+      "fields": [
+        {
+          "key": "mode",
+          "label": "模式（incremental 增量 / full 全量重建）",
+          "type": "text"
+        },
+        {
+          "key": "includeStrm",
+          "label": "同时补扫本地 STRM（一次性，耗时较长）",
+          "type": "boolean"
+        },
+        {
+          "key": "includeHistory",
+          "label": "同时补导入历史库文件（一次性）",
+          "type": "boolean"
+        },
+        {
+          "key": "includeCloud",
+          "label": "同时从云盘媒体库提取",
+          "type": "boolean"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string"
+          },
+          "includeStrm": {
+            "type": "boolean"
+          },
+          "includeHistory": {
+            "type": "boolean"
+          },
+          "includeCloud": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "dry-run",
+      "label": "预演比对（不删不搬）",
+      "fields": [
+        {
+          "key": "srcRoot",
+          "label": "源目录",
+          "type": "text"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "srcRoot": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "execute",
+      "label": "执行删除与搬迁",
+      "fields": [
+        {
+          "key": "srcRoot",
+          "label": "源目录",
+          "type": "text"
+        },
+        {
+          "key": "confirm",
+          "label": "输入 YES 确认执行",
+          "type": "text",
+          "required": true
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "srcRoot": {
+            "type": "string"
+          },
+          "confirm": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "run-job",
+      "label": "定时任务入口",
+      "fields": [
+        {
+          "key": "auto",
+          "label": "自动执行",
+          "type": "text"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "auto": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "recognize",
+      "label": "AI 识别并整理",
+      "fields": [
+        {
+          "key": "files",
+          "type": "files",
+          "label": "文件或目录（不选则用上一批 sha1 比对留下的快照）"
+        },
+        {
+          "key": "profileId",
+          "label": "整理方案（留空＝只识别不整理）",
+          "type": "number"
+        },
+        {
+          "key": "review",
+          "label": "整理前先确认",
+          "type": "boolean"
+        },
+        {
+          "key": "filesFromBatch",
+          "label": "只用上一批 sha1 比对留下的快照",
+          "type": "boolean"
+        },
+        {
+          "key": "batchAll",
+          "label": "快照取全部文件（含 sha1 命中的）",
+          "type": "boolean"
+        },
+        {
+          "key": "instructions",
+          "label": "补充线索",
+          "type": "text"
+        },
+        {
+          "key": "manual",
+          "label": "手动处理",
+          "type": "boolean"
+        },
+        {
+          "key": "useSha1",
+          "label": "先用 sha1 归约库过滤",
+          "type": "boolean"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "profileId": {
+            "type": "number"
+          },
+          "review": {
+            "type": "boolean"
+          },
+          "filesFromBatch": {
+            "type": "boolean"
+          },
+          "batchAll": {
+            "type": "boolean"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "manual": {
+            "type": "boolean"
+          },
+          "useSha1": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "retry-recognition",
+      "label": "重试识别",
+      "fields": [
+        {
+          "key": "flowKey",
+          "label": "识别记录 key",
+          "type": "text",
+          "required": true
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "flowKey": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "save-flow-settings",
+      "label": "保存流程设置",
+      "fields": [
+        {
+          "key": "srcRoot",
+          "label": "待处理源目录",
+          "type": "text"
+        },
+        {
+          "key": "profileId",
+          "label": "整理方案",
+          "type": "number"
+        },
+        {
+          "key": "aiReview",
+          "label": "AI 整理前确认",
+          "type": "boolean"
+        },
+        {
+          "key": "cronExpr",
+          "label": "定时 Cron",
+          "type": "text"
+        },
+        {
+          "key": "autoExecute",
+          "label": "定时里直接真删",
+          "type": "boolean"
+        },
+        {
+          "key": "maxDepth",
+          "label": "作品层最大层数",
+          "type": "number"
+        },
+        {
+          "key": "maxDelete",
+          "label": "单次最多删除",
+          "type": "number"
+        },
+        {
+          "key": "cleanEmpty",
+          "label": "清理空目录",
+          "type": "boolean"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "srcRoot": {
+            "type": "string"
+          },
+          "profileId": {
+            "type": "number"
+          },
+          "aiReview": {
+            "type": "boolean"
+          },
+          "cronExpr": {
+            "type": "string"
+          },
+          "autoExecute": {
+            "type": "boolean"
+          },
+          "maxDepth": {
+            "type": "number"
+          },
+          "maxDelete": {
+            "type": "number"
+          },
+          "cleanEmpty": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "save-lib-settings",
+      "label": "保存库来源目录",
+      "fields": [
+        {
+          "key": "mtDbPath",
+          "label": "MT 数据库路径",
+          "type": "text"
+        },
+        {
+          "key": "strmRoots",
+          "label": "STRM 扫描根",
+          "type": "text"
+        },
+        {
+          "key": "historyPath",
+          "label": "历史 sha1 文件",
+          "type": "text"
+        },
+        {
+          "key": "cloudRoots",
+          "label": "云盘媒体库目录",
+          "type": "text"
+        },
+        {
+          "key": "scanMinutes",
+          "label": "单次扫描时长上限（分钟）",
+          "type": "number"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mtDbPath": {
+            "type": "string"
+          },
+          "strmRoots": {
+            "type": "string"
+          },
+          "historyPath": {
+            "type": "string"
+          },
+          "cloudRoots": {
+            "type": "string"
+          },
+          "scanMinutes": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "sha1-match-recognize",
+      "label": "手动 sha1 匹配 + AI 核对",
+      "fields": [],
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "ai-sha1-settings",
+      "label": "保存识别设置",
+      "fields": [
+        {
+          "key": "profileId",
+          "label": "整理方案",
+          "type": "number"
+        },
+        {
+          "key": "review",
+          "label": "整理前确认",
+          "type": "boolean"
+        },
+        {
+          "key": "instructions",
+          "label": "补充说明",
+          "type": "textarea"
+        },
+        {
+          "key": "prompt",
+          "label": "识别提示词",
+          "type": "textarea"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "profileId": {
+            "type": "number"
+          },
+          "review": {
+            "type": "boolean"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "load-settings",
+      "label": "载入已保存设置",
+      "fields": [
+        {
+          "key": "scope",
+          "label": "范围（flow/lib）",
+          "type": "text"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "scan-complete",
+      "label": "扫描完成后继续",
+      "kind": "continuation",
+      "fields": [
+        {
+          "key": "flowKey",
+          "label": "识别流程键",
+          "type": "text"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "flowKey": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    {
+      "id": "organize-complete",
+      "label": "整理完成后继续",
+      "kind": "continuation",
+      "fields": [
+        {
+          "key": "flowKey",
+          "label": "识别流程键",
+          "type": "text"
+        }
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "flowKey": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "overview",
+      "label": "归约库与比对概览",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "id": "retry-state",
+      "label": "可重试文件数",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "flowKey": {
+            "type": "string",
+            "maxLength": 100
+          }
+        }
+      }
+    },
+    {
+      "id": "results",
+      "label": "识别结果",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "flowKey": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "revision": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses",
+      "label": "AI 原始回答",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "flowKey": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "revision": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "id": "history",
+      "label": "识别历史",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "id": "detail",
+      "label": "识别详情",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ],
+  "ui": {
+    "mode": "python",
+    "version": "2",
+    "entry": "",
+    "icon": "ui/icon.png"
+  }
+}

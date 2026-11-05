@@ -1,0 +1,12 @@
+[project]
+name = "media-sweep"
+version = "1.1.0"
+description = "整理清道夫：sha1 归约库比对删除，剩余交 AI 识别后由 MT 整理"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.mt-plugin]
+include = ["plugin.py", "plugin.json", "pyproject.toml", "uv.lock", "core", "ai", "prompts", "ui"]

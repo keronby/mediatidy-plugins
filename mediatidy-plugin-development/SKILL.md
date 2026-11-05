@@ -14,6 +14,7 @@ description: 开发、迁移和排查 MediaTidy Python SDK v2 插件，包括清
 - 环境、模板与打包：[快速开始](references/getting-started.md)。
 - 清单、schema、Python/JSON 命名：[清单与参数](references/manifest.md)。
 - 方法参数、权限、限额和允许通道：[methods.json](references/sdk/mt_plugin/methods.json)；实现入口是 [clients.py](references/sdk/mt_plugin/clients.py)。
+  两者为本包旧版快照，未含 `ffprobe.cache_exists`、`artifacts.*`、`emby.*`；这些新能力见 [业务接口](references/business.md) 与 [能力清单](references/capabilities.md)，运行时先用 `runtime.capabilities()` 探测。
 - Python 组件属性：[ui-registry.json](references/sdk/mt_plugin/ui-registry.json)。
 
 ## 选择随包资源
@@ -21,7 +22,8 @@ description: 开发、迁移和排查 MediaTidy Python SDK v2 插件，包括清
 默认从 [目录扫描模板](assets/plugin-sdk/starter/README.md) 复制到用户工作目录，SDK 位于 `references/sdk/`。安装作者依赖：在插件虚拟环境中安装 `<本 Skill>/references/sdk[dev]`，之后用 `uv run --no-sync python -m mt_plugin pack`。Python 固定 3.12，uv 固定 0.6.7；不要将宿主 SDK 加入插件运行依赖或锁文件。
 
 - 图片处理使用 [Pillow 示例](assets/plugin-sdk/examples/pillow/README.md)。
-- React 使用 [React 示例](assets/plugin-sdk/examples/react/README.md) 与 [公开前端 SDK](assets/plugin-frontend-sdk/package.json)，并读 [UI](references/ui.md)。保留 assets 下目录层次时本地依赖可直接解析；搬走模板后重设依赖并更新锁文件。React 作者另需 Node 22.12+，默认 Python 作者不需要。
+- React 使用 [React 示例](assets/plugin-sdk/examples/react/README.md) 与 [公开前端 SDK](assets/plugin-frontend-sdk/package.json)，并读 [UI](references/ui.md)。
+- Emby 与图片：[Emby 配置与通用 API](references/emby.md)、[临时图片与预览](references/artifacts.md)。保留 assets 下目录层次时本地依赖可直接解析；搬走模板后重设依赖并更新锁文件。React 作者另需 Node 22.12+，默认 Python 作者不需要。
 - 本包不含 AI 插件源码。处理其业务时阅读 [AI 工作流](references/ai-organize.md)，在可用的主仓库中检查 `mediatidy-plugin-template/`，不要凭旧示例重建已变更的行为。
 
 ## 实现时遵守的契约

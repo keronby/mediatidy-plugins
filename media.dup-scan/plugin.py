@@ -1,1027 +1,849 @@
 # -*- coding: utf-8 -*-
-"""媒体查重插件 (media.dup-scan)
+"""media.dup-scan — STRM 重复查重（MT Python SDK v2，1.1.0）
 
-【只读模式】：仅扫描目录、分析重复的 strm 或媒体文件，给出评分与保留建议。
-不执行任何真实的文件删除动作。
-
-功能特性：
-1. 自动从 MT「授权与配置」中加载本地路径与分享路径的不同整理方案及评分规则；
-2. 工作台免选方案：根据扫描目录路径智能分流（本地路径走本地方案，strm/分享路径走分享方案）；
-3. 电影按作品目录查重，支持首行读取解析真实后缀（原盘 ISO 槽位安全隔离）；
-4. 剧集按季集查重（不读取 strm 内容），性能极快；
-5. 结果 compact 瘦身，严格控制在 MT storage 256 KiB 安全上限以内；
-6. 支持平分/分差不足组的人工直接判定。
+重构要点（对齐官方 Wiki SDK v2）：
+- 不再用 os.walk/os.scandir/os.remove/绝对路径访问宿主文件；扫描走
+  ctx.mt.files.scan（异步任务）+ tasks.wait + @continuation 分页
+  tasks.items；读取 STRM 首行走 files.readText；删除走 files.batch
+  (operation=delete) / files.delete，附带文件先 files.stat 定位。
+- 目录用页面 DirectoryPicker 选择 {rootId, path}（path 相对 root，
+  root 为 "."），不再硬编码 NAS 根路径。
+- 结果按官方 storage-table 模式存储：scans/<runId>/summary +
+  scans/<runId>/groups/<seq:%04d>，currentScan 指针；查询用
+  storage.list(prefix,cursor,limit) 分页（limit 20），不依赖 offset。
+- 配置只用宿主 config（configSchema）+ storage 镜像（白名单校验，
+  found=false 时视为缺失，绝不把 envelope 当值）；删除插件目录下的
+  本地 JSON 文件 文件持久化。
+- 页面 get_page 只做静态组装：不调用 rules.list、不扫盘；绑定一律
+  state.*；Table 用 field 列定义。
+- validate_config 为纯函数（不调 SDK），仅校验字段类型/范围。
 """
-from __future__ import annotations
+import uuid
+from typing import Any
 
-import os
-import posixpath
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from mt_plugin import Plugin as PluginBase, action, continuation, query, ui
 
-from mt_plugin import Plugin as PluginBase, Context, action, continuation, query, ui
+from core.nameinfo import extract_real_ext
+from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, to_scorer_rules
+from core.workscan import parse_work_dir, scan_work, summarize
 
-from core import nameinfo, rules as rulelib, scoring, workscan
+MANIFEST_ID = "media.dup-scan"
+PLUGIN_VERSION = "1.1.0"
 
-PLUGIN_ID = "media.dup-scan"
-ROOT_DIR = "/vol1/@appshare/fn-deepseek-harness/mt插件"
+KV_CONFIG = "config"
+KV_CURRENT_SCAN = "currentScan"
+KV_TOOL_SCAN = "toolScan"
 
-# --------------------------------------------------------------------------- #
-# 常量定义
-# --------------------------------------------------------------------------- #
-KV_GROUPS = "groups"
-KV_META = "meta"
-KV_SELECTIONS = "selections"
+SCAN_LIMIT = 10000          # runtime.maxScanFiles 上限
+PAGE_SIZE = 100             # tasks.items 每页
+LIST_LIMIT = 20             # storage.list 单页（官方示例）
+MAX_GROUPS_STORED = 2000
+MAX_TOOL_ROWS = 2000
+DELETE_BATCH_LIMIT = 500    # files.batch 上限
+COMPANION_EXTS = (".nfo", "-mediainfo.json")
 
-PROFILE_KEYS = ("profileId", "organizeProfileId", "profile", "ruleProfileId")
-PREFERRED_RULE_IDS = ("quality-strm", "quality-movie", "quality-movie-zh", "quality-tv", "quality-tv-zh")
+DEFAULT_CONFIG: dict[str, Any] = {
+    "ruleId": "auto",
+    "readStrmContent": True,
+    "scanSource": None,   # {rootId, path}，上次选择的查重扫描目录
+    "toolSource": None,   # {rootId, path}，上次选择的工具扫描目录
+}
+CONFIG_KEYS = tuple(DEFAULT_CONFIG.keys())
 
-# --------------------------------------------------------------------------- #
-# KV Storage 包装
-# --------------------------------------------------------------------------- #
-def kv_get(ctx: Context, key: str) -> Any:
+
+# ---------------------------------------------------------------------------
+# 工具：storage 信封、安全读/写、idempotency
+# ---------------------------------------------------------------------------
+def _new_idempotency_key(ctx: Any, purpose: str) -> str:
     try:
-        val = ctx.mt.storage.get(key=key)
-        if isinstance(val, dict) and "value" in val:
-            val = val["value"]
-        return val
-    except Exception as exc:                                   # noqa: BLE001
-        msg = str(exc)
-        if "STORAGE_KEY_NOT_FOUND" in msg or "not found" in msg.lower() or "404" in msg:
-            return None
-        ctx.mt.log(level="warn", message="读取存储 [%s] 失败：%s" % (key, exc))
-        return None
+        return f"{ctx.run_id}:{purpose}"
+    except Exception:
+        return f"{purpose}:{uuid.uuid4().hex[:16]}"
 
 
-def kv_put(ctx: Context, key: str, value: Any) -> None:
+def _storage_get(ctx: Any, key: str, default: Any = None) -> Any:
+    """读 storage：忽略 found=false 的 envelope；found 区分“缺失”与 null。"""
+    try:
+        data = ctx.mt.storage.get(key=key)
+    except Exception:
+        return default
+    if not isinstance(data, dict):
+        return data if data is not None else default
+    if "found" in data:
+        if not data.get("found"):
+            return default
+        value = data.get("value")
+        return default if value is None else value
+    value = data.get("value", data)
+    return default if value is None else value
+
+
+def _storage_set(ctx: Any, key: str, value: Any) -> bool:
     try:
         ctx.mt.storage.set(key=key, value=value)
-    except Exception as exc:                                   # noqa: BLE001
-        ctx.mt.log(level="error", message="写入存储 [%s] 失败：%s" % (key, exc))
-
-
-def run_id(ctx: Context) -> str:
-    try:
-        rid = ctx.run_id
-        if rid:
-            return str(rid)
-    except Exception:                                          # noqa: BLE001
-        pass
-    data = getattr(ctx, "data", {}) or {}
-    return str(data.get("runId") or data.get("id") or "manual")
-
-
-def _cfg(ctx: Context) -> Dict[str, Any]:
-    raw = getattr(ctx, "config", None)
-    if isinstance(raw, dict):
-        return raw
-    data = getattr(ctx, "data", None)
-    if isinstance(data, dict):
-        cfg = data.get("config")
-        if isinstance(cfg, dict):
-            return cfg
-    return {}
-
-
-def _ignore_patterns(cfg: Dict[str, Any]) -> List[str]:
-    raw = cfg.get("ignorePaths") or ""
-    if isinstance(raw, list):
-        items = raw
-    else:
-        items = str(raw).splitlines()
-    out = []
-    for it in items:
-        s = str(it).strip()
-        if s and not s.startswith("#"):
-            out.append(s)
-    return out
-
-
-def _is_ignored(path: str, patterns: List[str]) -> bool:
-    if not patterns:
+        return True
+    except Exception:
         return False
-    norm = path.replace("\\", "/").strip("/")
-    parts = norm.split("/")
-    for pat in patterns:
-        pat = pat.replace("\\", "/").strip("/")
-        if not pat:
-            continue
-        if pat in parts or norm == pat or norm.startswith(pat + "/"):
-            return True
-        if posixpath.fnmatch(norm, pat) or posixpath.fnmatch(posixpath.basename(norm), pat):
-            return True
-    return False
 
 
-def _roots(ctx: Context) -> List[Dict[str, Any]]:
-    roots = getattr(ctx, "roots", None)
-    if isinstance(roots, list) and roots:
-        return [r for r in roots if isinstance(r, dict)]
-    grants = getattr(ctx, "grants", None)
-    if isinstance(grants, dict):
-        groots = grants.get("roots")
-        if isinstance(groots, list) and groots:
-            return [r for r in groots if isinstance(r, dict)]
-    return []
-
-
-def _selections(ctx: Context) -> List[Dict[str, str]]:
-    raw: Any = None
-    data = getattr(ctx, "data", None)
-    if isinstance(data, dict):
-        raw = data.get("selections") or data.get("dirs")
-    if not raw:
-        input_dict = getattr(ctx, "input", None)
-        if isinstance(input_dict, dict):
-            raw = input_dict.get("dirs") or input_dict.get("selections")
-    if not raw and isinstance(data, dict):
-        inp = data.get("input")
-        if isinstance(inp, dict):
-            raw = inp.get("dirs") or inp.get("selections")
-
-    items: List[Dict[str, Any]] = []
-    if isinstance(raw, list):
-        items = [x for x in raw if isinstance(x, dict)]
-    elif isinstance(raw, dict):
-        items = [raw]
-
-    roots = _roots(ctx)
-    out: List[Dict[str, str]] = []
-    for it in items:
-        root_id = it.get("rootId") or it.get("id") or ""
-        path = it.get("path") or it.get("dir") or ""
-        if not root_id:
-            root_id = _guess_root(it, roots) or ""
-        if not root_id and roots:
-            root_id = str(roots[0].get("id") or "")
-        path = "/" + str(path).lstrip("/")
-        if root_id:
-            out.append({"rootId": str(root_id), "path": path})
-
-    if not out and roots:
-        for r in roots:
-            rid = r.get("id")
-            if rid:
-                out.append({"rootId": str(rid), "path": "/"})
-                break
-    return out
-
-
-def _guess_root(item: Dict[str, Any], roots: List[Dict[str, Any]]) -> Optional[str]:
-    path = str(item.get("path") or item.get("dir") or "")
-    if not path or not roots:
-        return None
-    norm = "/" + path.strip("/")
-    best_id: Optional[str] = None
-    best_len = -1
-    for r in roots:
-        rpath = "/" + str(r.get("path") or "").strip("/")
-        if norm == rpath or norm.startswith(rpath + "/"):
-            if len(rpath) > best_len:
-                best_len = len(rpath)
-                best_id = str(r.get("id"))
-    return best_id
-
-
-# --------------------------------------------------------------------------- #
-# MT 方案与评分规则路由解析（本地路径与分享路径双引擎智能适配）
-# --------------------------------------------------------------------------- #
-def _profile_items(got: Any) -> List[Dict[str, Any]]:
-    if isinstance(got, dict):
-        got = got.get("items") or got.get("profiles") or []
-    return [p for p in (got or []) if isinstance(p, dict)]
-
-
-def _profiles(ctx: Context) -> List[Dict[str, Any]]:
-    try:
-        items = _profile_items(ctx.mt.organize.profiles())
-    except Exception as exc:                                   # noqa: BLE001
-        ctx.mt.log(level="warn", message="读取整理方案失败：%s" % exc)
-        items = []
-    out = []
-    for it in items:
-        src = it.get("sourceDir") or (it.get("source") or {}).get("path") or ""
-        dst = it.get("destDir") or it.get("outputDir") or (it.get("destination") or {}).get("path") or ""
-        out.append({
-            "id": it.get("id"),
-            "name": it.get("name") or ("#%s" % it.get("id")),
-            "source_dir": src,
-            "dest_dir": dst,
-            "is_inplace_strm": ("/strm" in str(src)) and not dst,
-            "quality_rule_id": it.get("qualityRuleId") or "",
-        })
-    return out
-
-
-def _quality_rules(ctx: Context) -> List[Dict[str, Any]]:
-    try:
-        got = ctx.mt.rules.list()
-    except Exception as exc:                                   # noqa: BLE001
-        ctx.mt.log(level="warn", message="读取质量规则失败：%s" % exc)
-        return []
-    if isinstance(got, dict):
-        got = got.get("items") or got.get("rules") or []
-    out = []
-    for it in (got or []):
-        if not isinstance(it, dict):
-            continue
-        base = dict(it)
-        if isinstance(base.get("definition"), dict):
-            merged = dict(base["definition"])
-            merged.setdefault("id", base.get("id"))
-            merged.setdefault("name", base.get("name"))
-            base = merged
-        if "scoring" in base or "quality" in str(base.get("id", "")):
-            out.append(base)
-    return out
-
-
-def _build_single_rule(ctx: Context, cfg: Dict[str, Any], profile: Optional[Dict[str, Any]],
-                       all_rules: List[Dict[str, Any]], by_id: Dict[str, Any],
-                       kind_name: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    """为指定方案构建评分规则。"""
-    eff_id = None
-    if profile:
+def _storage_list(ctx: Any, prefix: str, limit: int = LIST_LIMIT) -> list[dict[str, Any]]:
+    """按 prefix,cursor,limit 分页拉全（官方 storage.list 不支持 offset）。"""
+    out: list[dict[str, Any]] = []
+    cursor = None
+    for _ in range(200):  # 最多 200 页 * 20 = 4000 条，防失控
         try:
-            eff = ctx.mt.rules.effective(profile_id=profile["id"])
-            if isinstance(eff, dict):
-                eff_id = ((eff.get("selection") or {}).get("qualityRuleId")
-                          or (eff.get("profile") or {}).get("qualityRuleId"))
-        except Exception:                                      # noqa: BLE001
-            pass
-        eff_id = eff_id or profile.get("quality_rule_id")
+            data = ctx.mt.storage.list(prefix=prefix, cursor=cursor, limit=limit, values=True)
+        except Exception:
+            break
+        items = data.get("items", []) if isinstance(data, dict) else []
+        out.extend(items)
+        cursor = data.get("nextCursor") if isinstance(data, dict) else None
+        if not cursor:
+            break
+    return out
 
-    rule_raw = None
-    via = "未匹配到规则"
-    if eff_id and str(eff_id) in by_id:
-        rule_raw = by_id[str(eff_id)]
-        via = "%s方案 #%s 生效规则 %s" % (kind_name, profile["id"], eff_id)
-    else:
-        for pref in PREFERRED_RULE_IDS:
-            if pref in by_id:
-                rule_raw = by_id[pref]
-                via = "%s默认优先 %s" % (kind_name, pref)
-                break
-        if not rule_raw and all_rules:
-            rule_raw = all_rules[0]
-            via = "%s首个可用规则" % kind_name
 
-    if not rule_raw:
-        return None, {"error": "无可用规则 (%s)" % via, "via": via}
-
-    rules_norm, unsup, disabled = rulelib.to_scorer_rules(rule_raw)
-
-    override = cfg.get("minScoreDiff")
+def _cfg(ctx: Any) -> dict[str, Any]:
+    cfg = dict(DEFAULT_CONFIG)
+    saved = _storage_get(ctx, KV_CONFIG, default=None)
+    if isinstance(saved, dict):
+        for key in CONFIG_KEYS:
+            if key in saved:
+                cfg[key] = saved[key]
     try:
-        override = float(override or 0)
-    except (TypeError, ValueError):
-        override = 0.0
+        host = ctx.config
+    except Exception:
+        host = None
+    if host is not None:
+        for key in CONFIG_KEYS:
+            try:
+                value = getattr(host, key, None)
+            except Exception:
+                value = None
+            if value is not None:
+                cfg[key] = value
+    cfg["ruleId"] = str(cfg.get("ruleId") or "auto")
+    cfg["readStrmContent"] = bool(cfg.get("readStrmContent", True))
+    # scanSource/toolSource 归一化（非法则丢弃，回落 None）
+    cfg["scanSource"] = _clean_source(cfg.get("scanSource")) if cfg.get("scanSource") else None
+    cfg["toolSource"] = _clean_source(cfg.get("toolSource")) if cfg.get("toolSource") else None
+    return cfg
 
-    if override > 0:
-        rules_norm["min_score_diff"] = override
-        diff_src = "配置覆盖"
-    else:
-        diff_src = "MT 规则原生 minScoreDiff"
-
-    info = {
-        "entryId": rules_norm.get("entry_id") or rule_raw.get("id"),
-        "entryName": rules_norm.get("entry_name") or rule_raw.get("name"),
-        "via": via,
-        "minScoreDiff": rules_norm.get("min_score_diff", 0.0),
-        "minScoreDiffSource": diff_src,
-        "profileId": (profile or {}).get("id"),
-        "profileName": (profile or {}).get("name") or ("#%s" % (profile or {}).get("id")),
-        "weights": rulelib.weights_table(rules_norm),
-        "maxScore": _max_score(rules_norm),
-        "unsupportedDims": unsup,
-        "disabledDims": disabled,
-    }
-    return rules_norm, info
+def _persist_sources(ctx: Any, cfg: dict[str, Any], source: Any = None, tool_source: Any = None) -> None:
+    """扫描/工具扫描时把本次选择的目录+规则回写 KV_CONFIG，下次打开页面自动回填。"""
+    changed = False
+    clean = _clean_source(source) if source else None
+    if clean is not None and clean != cfg.get("scanSource"):
+        cfg["scanSource"] = clean; changed = True
+    tclean = _clean_source(tool_source) if tool_source else None
+    if tclean is not None and tclean != cfg.get("toolSource"):
+        cfg["toolSource"] = tclean; changed = True
+    if changed:
+        _storage_set(ctx, KV_CONFIG, {k: cfg.get(k) for k in CONFIG_KEYS})
 
 
-def _resolve_route_rules(ctx: Context) -> Dict[str, Any]:
-    """从「授权与配置」中解析本地路径和分享路径的不同整理方案与评分规则。"""
-    cfg = _cfg(ctx)
-    all_profiles = _profiles(ctx)
-    all_rules = _quality_rules(ctx)
-    by_rule_id = {str(r.get("id")): r for r in all_rules}
+def _cfg_view(ctx: Any) -> dict[str, Any]:
+    return {key: _cfg(ctx).get(key, DEFAULT_CONFIG[key]) for key in CONFIG_KEYS}
 
-    grants = getattr(ctx, "grants", {}) or {}
-    if not isinstance(grants, dict):
-        grants = {}
 
-    # 1. 本地路径方案选取
-    local_want = str(cfg.get("localProfileId") or "").strip()
-    local_prof = None
-    if local_want:
-        local_prof = next((p for p in all_profiles if str(p.get("id")) == local_want), None)
-    if not local_prof:
-        for pid in (grants.get("profileIds") or []):
-            p = next((x for x in all_profiles if str(x.get("id")) == str(pid)), None)
-            if p and not p.get("is_inplace_strm") and "strm" not in (p.get("name") or "").lower():
-                local_prof = p
-                break
-    if not local_prof:
-        local_prof = next((p for p in all_profiles if "洗版" in p.get("name", "") or "本地" in p.get("name", "")), None)
-    if not local_prof and all_profiles:
-        local_prof = all_profiles[0]
+def _clean_source(value: Any) -> dict[str, Any] | None:
+    """归一化 DirectoryPicker 结果 {rootId, path}；非法返回 None。"""
+    if not isinstance(value, dict):
+        return None
+    root_id = str(value.get("rootId") or value.get("root_id") or "").strip()
+    path = str(value.get("path") or ".").strip() or "."
+    if path.startswith("/") or ".." in path.split("/"):
+        return None
+    if not root_id:
+        return None
+    return {"rootId": root_id, "path": path}
 
-    # 2. 分享/STRM 路径方案选取
-    share_want = str(cfg.get("shareProfileId") or "").strip()
-    share_prof = None
-    if share_want:
-        share_prof = next((p for p in all_profiles if str(p.get("id")) == share_want), None)
-    if not share_prof:
-        for pid in (grants.get("strmProfileIds") or []):
-            p = next((x for x in all_profiles if str(x.get("id")) == str(pid)), None)
-            if p:
-                share_prof = p
-                break
-    if not share_prof:
-        share_prof = next((p for p in all_profiles if "strm" in p.get("name", "").lower() or "秒传" in p.get("name", "")), None)
-    if not share_prof:
-        share_prof = local_prof
 
-    # 构建两套规则
-    local_rules, local_info = _build_single_rule(ctx, cfg, local_prof, all_rules, by_rule_id, kind_name="本地")
-    share_rules, share_info = _build_single_rule(ctx, cfg, share_prof, all_rules, by_rule_id, kind_name="分享/STRM")
+def _work_dir_of(file_path: str) -> str:
+    """向上找含 [tmdbid-…] 的作品目录；file_path 为 root 相对路径。"""
+    parts = [p for p in str(file_path).split("/") if p not in ("", ".")]
+    for i in range(len(parts) - 1, 0, -1):
+        candidate = "/".join(parts[:i])
+        if parse_work_dir(candidate.rsplit("/", 1)[-1]):
+            return candidate
+    return "/".join(parts[:-1]) if len(parts) > 1 else "."
 
-    raw_keywords = str(cfg.get("sharePathKeywords") or "strm,云盘").strip()
-    share_keywords = [k.strip().lower() for k in raw_keywords.split(",") if k.strip()]
 
-    status_text = (
-        "📌 本地路径方案：%s ➔ 规则：%s（门槛：%s）\n"
-        "📌 分享路径方案：%s ➔ 规则：%s（门槛：%s）\n"
-        "💡 路径包含 [%s] 走分享方案，其余走本地方案。"
-    ) % (
-        local_info.get("profileName") or "未匹配",
-        local_info.get("entryName") or local_info.get("entryId") or "无",
-        local_info.get("minScoreDiff", 0),
-        share_info.get("profileName") or "未匹配",
-        share_info.get("entryName") or share_info.get("entryId") or "无",
-        share_info.get("minScoreDiff", 0),
-        ", ".join(share_keywords),
-    )
-
+def _compact_file(item: dict[str, Any]) -> dict[str, Any]:
     return {
-        "local": {"profile": local_prof, "rules": local_rules, "info": local_info},
-        "share": {"profile": share_prof, "rules": share_rules, "info": share_info},
-        "share_keywords": share_keywords,
-        "statusText": status_text,
+        "rel": item.get("rel", ""),
+        "name": item.get("name", ""),
+        "score": item.get("score", 0),
+        "why": item.get("why", ""),
+        "slot": item.get("slot", ""),
+        "ref": item.get("ref", ""),
+        "version": item.get("version", ""),
+        "rootId": item.get("rootId", ""),
     }
 
 
-def _get_rules_for_work(work_path: str, route_rules: Dict[str, Any]) -> Dict[str, Any]:
-    """根据作品目录路径自动适配对应的评分规则。"""
-    p_lower = work_path.lower()
-    for kw in route_rules.get("share_keywords", []):
-        if kw in p_lower:
-            return route_rules["share"]["rules"]
-    return route_rules["local"]["rules"]
+def _compact_group(group: dict[str, Any]) -> dict[str, Any]:
+    files = [_compact_file(f) for f in group.get("files", [])]
+    return {
+        "workDir": group.get("workDir", ""),
+        "title": group.get("title", ""),
+        "year": group.get("year", ""),
+        "kind": group.get("kind", ""),
+        "slot": group.get("slot", ""),
+        "label": group.get("label", ""),
+        "season": group.get("season", ""),
+        "episode": group.get("episode", ""),
+        "verdict": group.get("verdict", ""),
+        "minDiff": group.get("minDiff", group.get("min_diff", 0)),
+        "diff": group.get("diff", 0),
+        "keep": group.get("keep", []),
+        "drop": group.get("drop", []),
+        "files": files,
+    }
 
 
-def _max_score(rules: Dict[str, Any]) -> float:
-    scoring_map = rules.get("scoring") or {}
-    total = 0.0
-    for dim, spec in scoring_map.items():
-        if not isinstance(spec, dict):
-            continue
-        weight = spec.get("weight")
-        try:
-            total += 10.0 * float(weight or 0.0)
-        except (TypeError, ValueError):
-            pass
-    return round(total, 2)
+def _resolve_rules(ctx: Any, cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """返回 (候选规则列表, 选中的单条规则 dict)。scan_work 只吃单条 dict。"""
+    all_rules = load_all_rules(ctx)
+    if not all_rules:
+        all_rules = list(DEFAULT_FALLBACK_RULES)
+    rule_id = str(cfg.get("ruleId") or "auto")
+    if rule_id and rule_id != "auto":
+        # get_rule_by_id 官方签名 (rule_id, ctx=None)，无第三个参数
+        chosen = get_rule_by_id(rule_id, ctx)
+        if isinstance(chosen, dict):
+            return [chosen], chosen
+        for r in all_rules:
+            if isinstance(r, dict) and str(r.get("id")) == rule_id:
+                return [r], r
+    return list(all_rules), (all_rules[0] if all_rules else {})
 
 
-# --------------------------------------------------------------------------- #
-# 插件类声明与工作台
-# --------------------------------------------------------------------------- #
-class Plugin(PluginBase):
-    def validate_config(self, config: Dict[str, Any], ctx: Context) -> Optional[Dict[str, Any]]:
-        return None
+def _evaluate_works(
+    ctx: Any,
+    works: dict[str, list[dict[str, Any]]],
+    rules: Any,
+    read_content: bool,
+) -> list[dict[str, Any]]:
+    """对每个作品目录用 core.workscan.scan_work 评分比对。
 
-    def on_init(self, ctx: Context) -> None:
-        ctx.mt.log(level="info", message="媒体查重插件已加载（只读模式，自动路由本地与分享方案）")
-
-    # ---------------------------- 页面 ---------------------------- #
-    def get_page(self, ctx: Context):
-        def tcol(label: str, field: str) -> Dict[str, Any]:
-            return {"label": label, "field": field, "cells": [ui.Text(text=ui.ref("row." + field))]}
-
-        return ui.page(
-            ui.Alert(
-                text="【调试模式】当前仅扫描分析并提供洗版保留建议，不执行真实删除。",
-                tone="primary",
-            ),
-            ui.Card(
-                ui.Text(text="选择要扫描的媒体目录。插件只在每个作品目录内部查重，不跨目录误删。"),
-                ui.FilePicker(),
-                ui.Button(label="开始扫描", variant="default",
-                          onClick=[{"type": "invoke", "actionId": "dup-scan"}]),
-                ui.Button(label="刷新数据", variant="outline",
-                          onClick=[{"type": "query", "queryId": "summary"}]),
-                ui.Button(label="清空结果", variant="ghost",
-                          onClick=[{"type": "invoke", "actionId": "dup-clear"}]),
-                title="媒体查重",
-            ),
-            ui.Card(
-                ui.Text(text=ui.ref("query.rules.data.statusText")),
-                title="已生效的整理方案与评分规则（由「授权与配置」自动加载）",
-            ),
-            ui.Grid(
-                ui.Metric(label="重复组", value=ui.ref("query.summary.data.groups")),
-                ui.Metric(label="可洗版", value=ui.ref("query.summary.data.washGroups"), tone="warning"),
-                ui.Metric(label="分差不足", value=ui.ref("query.summary.data.tieGroups"), tone="muted"),
-                columns=3, gap="md",
-            ),
-            ui.Progress(label=ui.ref("run.progress.message"),
-                        value=ui.ref("run.progress.completed"),
-                        total=ui.ref("run.progress.total")),
-            ui.Text(text=ui.ref("query.summary.data.updatedAt")),
-            ui.Card(
-                ui.Text(text=ui.ref("query.summary.data.ruleName")),
-                ui.Table(source=ui.ref("query.summary.data.weights"), rowKey="dimension",
-                         columns=[tcol("维度", "dimension"), tcol("权重", "weight"),
-                                  tcol("优先级", "priority"), tcol("未知", "unknown")]),
-                title="本次使用的评分规则明细",
-            ),
-            ui.Card(
-                ui.Table(source=ui.ref("query.summary.data.washTable"), rowKey="id", searchable=True, sortable=True,
-                         columns=[tcol("作品", "title"), tcol("集/槽位", "label"), tcol("分差", "diff"),
-                                  tcol("保留", "keep"), tcol("删除", "drop"), tcol("目录", "dir")]),
-                title="🎯 可洗版组（有明确赢家）",
-            ),
-            ui.Card(
-                ui.Text(text="以下重复组分差未达规则门槛。点击右侧按钮可人工直接选定胜出版本："),
-                ui.Table(source=ui.ref("query.summary.data.tieTable"), rowKey="id", searchable=True,
-                         columns=[
-                             tcol("作品", "title"),
-                             tcol("集/槽位", "label"),
-                             tcol("分差/门槛", "diffText"),
-                             tcol("候选版本 A（得分）", "keep"),
-                             tcol("候选版本 B（得分）", "drop"),
-                             {
-                                 "label": "人工判定选择",
-                                 "cells": [
-                                     ui.Button(label="保留 A", variant="secondary",
-                                               onClick=[{"type": "invoke", "actionId": "manual-decide",
-                                                         "input": {"groupId": ui.ref("row.id"), "keepRel": ui.ref("row.keepRel")}},
-                                                        {"type": "query", "queryId": "summary"}]),
-                                     ui.Button(label="保留 B", variant="outline",
-                                               onClick=[{"type": "invoke", "actionId": "manual-decide",
-                                                         "input": {"groupId": ui.ref("row.id"), "keepRel": ui.ref("row.dropRel")}},
-                                                        {"type": "query", "queryId": "summary"}]),
-                                 ]
-                             },
-                             tcol("目录", "dir"),
-                         ]),
-                title="🤔 分差不足（不判胜负，请人工选择）",
-            ),
-            ui.RunHistory(),
-            state={},
-            queries=[{"id": "summary", "name": "summary"},
-                     {"id": "rules", "name": "rules"}],
-        )
-
-    # ---------------------------- 查询 ---------------------------- #
-    @query("summary")
-    def summary(self, input: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-        meta = kv_get(ctx, KV_META) or {}
-        groups = kv_get(ctx, KV_GROUPS) or []
-        pending = kv_get(ctx, "_pending") or []
-
-        wash_rows: List[Dict[str, Any]] = []
-        tie_rows: List[Dict[str, Any]] = []
-        for g in groups:
-            r = _row(g)
-            if g.get("verdict") == "keep":
-                wash_rows.append(r)
-            elif g.get("verdict") == "tie":
-                tie_rows.append(r)
-
-        return {
-            "groups": len(groups),
-            "washGroups": len(wash_rows),
-            "tieGroups": len(tie_rows),
-            "pending": len(pending),
-            "updatedAt": meta.get("updatedAt") or "暂无扫描记录",
-            "ruleName": meta.get("ruleText") or "未加载评分规则",
-            "weights": meta.get("weights") or [],
-            "washTable": wash_rows,
-            "tieTable": tie_rows,
-            "meta": {k: v for k, v in meta.items() if k not in ("weights",)},
-        }
-
-    @query("rules")
-    def rules_view(self, input: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-        routes = _resolve_route_rules(ctx)
-        share_info = routes["share"]["info"]
-        return {
-            "ok": True,
-            "statusText": routes["statusText"],
-            "localInfo": routes["local"]["info"],
-            "shareInfo": share_info,
-            "weights": share_info.get("weights") or [],
-            "maxScore": share_info.get("maxScore") or 0.0,
-            "minScoreDiff": share_info.get("minScoreDiff") or 0.0,
-        }
-
-    # ---------------------------- 动作 ---------------------------- #
-    @action("save-rules")
-    def save_rules(self, input: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-        return {"waiting": False, "ok": True}
-
-    @action("manual-decide")
-    def manual_decide(self, input: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-        gid = str(input.get("groupId") or "").strip()
-        keep_rel = str(input.get("keepRel") or "").strip()
-        if not gid or not keep_rel:
-            return {"waiting": False, "ok": False, "error": "缺少参数"}
-
-        groups = kv_get(ctx, KV_GROUPS) or []
-        modified = False
-        for g in groups:
-            if g.get("id") == gid:
-                old_verdict = g.get("verdict")
-                cand_a = g.get("winner") or {}
-                cand_b = g.get("loser") or {}
-                rel_a = cand_a.get("rel")
-                rel_b = cand_b.get("rel")
-
-                if keep_rel == rel_a:
-                    g["verdict"] = "keep"
-                    g["winner"] = cand_a
-                    g["loser"] = cand_b
-                    g["diff_text"] = "人工裁定保留 A"
-                    modified = True
-                elif keep_rel == rel_b:
-                    g["verdict"] = "keep"
-                    g["winner"] = cand_b
-                    g["loser"] = cand_a
-                    g["diff_text"] = "人工裁定保留 B"
-                    modified = True
-                break
-
-        if modified:
-            kv_put(ctx, KV_GROUPS, groups)
-            meta = kv_get(ctx, KV_META) or {}
-            meta["updatedAt"] = "%s｜人工判定已更新组 %s" % (_now(), gid)
-            kv_put(ctx, KV_META, meta)
-            ctx.mt.log(level="info", message="人工裁定成功：组 %s 保留版本 %s" % (gid, keep_rel))
-            return {"waiting": False, "ok": True, "groupId": gid, "keepRel": keep_rel}
-
-        return {"waiting": False, "ok": False, "error": "未找到指定重复组或路径不匹配"}
-
-    @action("dup-clear")
-    def clear(self, input: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-        kv_put(ctx, KV_GROUPS, [])
-        kv_put(ctx, KV_META, {"state": "idle", "updatedAt": "已清空", "scanned": 0, "works": 0})
-        kv_put(ctx, "_pending", [])
-        ctx.mt.log(level="info", message="已清空所有扫描结果")
-        return {"waiting": False, "cleared": True}
-
-    @action("dup-scan")
-    def scan(self, input: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-        try:
-            return self._scan_impl(input, ctx)
-        except Exception as exc:                               # noqa: BLE001
-            ctx.mt.log(level="error", message="扫描异常：%s: %s" % (type(exc).__name__, exc))
-            return {"waiting": False, "error": str(exc)}
-
-    def _scan_impl(self, input: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-        routes = _resolve_route_rules(ctx)
-        sels = _selections(ctx)
-        if not sels:
-            ctx.mt.log(level="error", message="没有可用的扫描目录")
-            return {"waiting": False, "error": "请先选择要扫描的目录"}
-
-        cfg = _cfg(ctx)
-        ignores = _ignore_patterns(cfg)
-        rid = run_id(ctx)
-
-        # ---------------- 极速 FAST PATH 本地直通 ---------------- #
-        fast_dirs = []
-        for s in sels:
-            p = s.get("path", "")
-            local_cand = os.path.join(ROOT_DIR, p.lstrip("/"))
-            if os.path.isdir(local_cand):
-                fast_dirs.append(local_cand)
-
-        if len(fast_dirs) == len(sels):
-            t0 = time.time()
-            ctx.mt.log(level="info", message="【极速直通】检测到本地开发路径，启用秒级极速扫描...")
-
-            by_work: Dict[str, List[Dict[str, Any]]] = {}
-            scanned_files = 0
-            for d in fast_dirs:
-                for root, dirs, files in os.walk(d):
-                    for f in files:
-                        if not f.endswith(".strm"):
-                            continue
-                        full_p = os.path.join(root, f)
-                        rel = os.path.relpath(full_p, ROOT_DIR)
-                        if _is_ignored(rel, ignores):
-                            continue
-                        work = _work_dir_of(rel)
-                        if not work:
-                            continue
-                        scanned_files += 1
-                        by_work.setdefault(work, []).append({
-                            "rel": rel,
-                            "name": f,
-                            "full": full_p,
-                            "rootId": "local",
-                        })
-
-            ctx.mt.log(level="info", message="【极速直通】遍历完成：耗时 %.2f 秒，发现 %d 个 strm，%d 个作品目录"
-                       % (time.time() - t0, scanned_files, len(by_work)))
-
-            groups = _process_works(ctx, by_work, routes)
-            compact_groups = _compact_groups(groups, max_items=400)
-
-            share_info = routes["share"]["info"]
-            kv_put(ctx, KV_GROUPS, compact_groups)
-            kv_put(ctx, KV_META, {
-                "state": "done",
-                "updatedAt": "%s｜扫描 %d 个文件 / %d 个作品目录 / %d 组重复（极速直通）"
-                             % (_now(), scanned_files, len(by_work), len(groups)),
-                "scanned": scanned_files,
-                "works": len(by_work),
-                "ruleText": routes["statusText"],
-                "weights": share_info.get("weights"),
-            })
-            kv_put(ctx, "_pending", [])
-
-            keep = sum(1 for g in compact_groups if g.get("verdict") == "keep")
-            tie = sum(1 for g in compact_groups if g.get("verdict") == "tie")
-            ctx.mt.log(level="info", message="分析完成：%d 组重复（可洗版 %d，分差不足 %d）"
-                       % (len(compact_groups), keep, tie))
-            return {"waiting": False, "groups": len(compact_groups), "scanned": scanned_files}
-
-        # ---------------- 宿主标准异步任务扫描 ---------------- #
-        pending: List[Dict[str, Any]] = []
-        for idx, sel in enumerate(sels):
-            task_id = _start_scan(ctx, sel, idx, rid)
-            if task_id:
-                pending.append({
-                    "taskId": task_id,
-                    "rootId": sel.get("rootId"),
-                    "path": sel.get("path"),
-                    "ref": {"taskId": task_id, "rootId": sel.get("rootId"), "path": sel.get("path")},
-                })
-
-        if not pending:
-            ctx.mt.log(level="error", message="所有目录提交扫描均失败")
-            return {"waiting": False, "error": "提交扫描任务失败"}
-
-        share_info = routes["share"]["info"]
-        kv_put(ctx, "_pending", pending)
-        kv_put(ctx, KV_META, {
-            "state": "scanning",
-            "updatedAt": "%s｜正在扫描 %d 个目录..." % (_now(), len(pending)),
-            "scanned": 0,
-            "works": 0,
-            "ruleText": routes["statusText"],
-            "weights": share_info.get("weights"),
-            "ignores": ignores,
-        })
-
-        task_ids = [p["taskId"] for p in pending]
-        ctx.mt.log(level="info", message="已下发 %d 个扫描任务，等待完成：%s"
-                   % (len(task_ids), task_ids))
-
-        try:
-            ctx.mt.tasks.wait(
-                task_ids=task_ids,
-                continuation="dup-collect",
-                timeout_seconds=600,
-                all=True,
-            )
-        except Exception as exc:                               # noqa: BLE001
-            ctx.mt.log(level="warn", message="挂载等待失败（%s: %s），改为立即收集" % (type(exc).__name__, exc))
-            return self.collect({}, ctx)
-
-        return {"waiting": True}
-
-    # -------------------------- 续跑：收集结果 -------------------------- #
-    @continuation("dup-collect")
-    def collect(self, input: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-        meta = kv_get(ctx, KV_META) or {}
-        pending = kv_get(ctx, "_pending") or []
-        if not pending:
-            ctx.mt.log(level="warn", message="没有待收集的扫描任务")
-            return {"waiting": False}
-
-        ignores = meta.get("ignores") or []
-        routes = _resolve_route_rules(ctx)
-
-        scanned = 0
-        by_work: Dict[str, List[Dict[str, Any]]] = {}
-        for item in pending:
-            ref = item.get("ref")
-            file_items = _collect_files(ctx, ref, ignores)
-            scanned += len(file_items)
-            for it in file_items:
-                rel = it["path"]
-                name = it["name"]
-                work = _work_dir_of(rel)
-                if not work:
-                    continue
-                by_work.setdefault(work, []).append({
-                    "rel": rel,
-                    "name": name,
-                    "ref": it.get("ref"),
-                    "rootId": it.get("rootId"),
-                })
-
-        ctx.mt.log(level="info", message="收到 %d 个 strm，分布在 %d 个作品目录"
-                   % (scanned, len(by_work)))
-
-        groups = _process_works(ctx, by_work, routes)
-        compact_groups = _compact_groups(groups, max_items=400)
-
-        share_info = routes["share"]["info"]
-        kv_put(ctx, KV_GROUPS, compact_groups)
-        meta.update({
-            "state": "done",
-            "updatedAt": "%s｜扫描 %d 个文件 / %d 个作品目录 / %d 组重复"
-                         % (_now(), scanned, len(by_work), len(groups)),
-            "scanned": scanned,
-            "works": len(by_work),
-            "ruleText": routes["statusText"],
-            "weights": share_info.get("weights"),
-        })
-        kv_put(ctx, KV_META, meta)
-        kv_put(ctx, "_pending", [])
-
-        keep = sum(1 for g in compact_groups if g.get("verdict") == "keep")
-        tie = sum(1 for g in compact_groups if g.get("verdict") == "tie")
-        ctx.mt.log(level="info", message="分析完成：%d 组重复（可洗版 %d，分差不足 %d）"
-                   % (len(compact_groups), keep, tie))
-        return {"waiting": False}
-
-
-# --------------------------------------------------------------------------- #
-# 作品处理与打分判定
-# --------------------------------------------------------------------------- #
-def _process_works(ctx: Context, by_work: Dict[str, List[Dict[str, Any]]],
-                   routes: Dict[str, Any]) -> List[Dict[str, Any]]:
-    groups: List[Dict[str, Any]] = []
-    for work, entries in by_work.items():
+    readStrmContent 开启且同作品 STRM >= 2 时，才对候选文件 readText
+    读取首行提取真实扩展名做 ISO 槽隔离；其余用文件后缀兜底。
+    """
+    # rules 可能是列表（_resolve_rules 旧返回）或单 dict：只取第一条 dict
+    if isinstance(rules, list):
+        rules = next((r for r in rules if isinstance(r, dict)), None)
+    scorer_rules = to_scorer_rules(rules) if isinstance(rules, dict) and rules else to_scorer_rules(DEFAULT_FALLBACK_RULES[0])
+    groups: list[dict[str, Any]] = []
+    for work_dir in sorted(works):
+        entries = works[work_dir]
         if len(entries) < 2:
             continue
-        if not workscan.parse_work_dir(posixpath.basename(work)):
-            continue
-
-        # 动态获取匹配该作品目录的评分规则
-        rules = _get_rules_for_work(work, routes)
-        if not rules:
-            continue
-
-        is_tv = any(nameinfo.parse(e["name"]).get("episode") is not None for e in entries)
-
-        if not is_tv:
-            for e in entries:
-                e["real_ext"] = _read_strm_real_ext(ctx, e)
-
-        norm_files: List[workscan.ScannedFile] = []
-        for e in entries:
-            parsed = nameinfo.parse(e["name"])
-            real_ext = e.get("real_ext")
-            if real_ext:
-                parsed["file_extension"] = real_ext
-
-            sf = workscan.ScannedFile(
-                path=e["rel"],
-                name=e["name"],
-                info=parsed,
-                raw=e,
-            )
-            norm_files.append(sf)
-
-        res = workscan.scan_work_directory(
-            work_dir=work,
-            files=norm_files,
-            rules=rules,
-            show_tie=True,
-        )
-
-        for g in res.groups:
-            winner_dict = _compact_file(g.winner.to_dict() if g.winner else None)
-            loser_dict = _compact_file(g.loser.to_dict() if g.loser else None)
-
-            groups.append({
-                "id": g.group_id,
-                "work": work,
-                "work_title": res.work_title,
-                "work_year": res.work_year,
-                "season": g.season,
-                "episode": g.episode,
-                "slot": g.slot,
-                "verdict": g.verdict,
-                "diff": round(g.diff, 2),
-                "diff_text": g.diff_text,
-                "winner": winner_dict,
-                "loser": loser_dict,
-                "candidates_count": len(g.candidates),
-            })
+        if read_content:
+            for entry in entries:
+                ref = entry.get("ref")
+                if not ref:
+                    continue
+                try:
+                    data = ctx.mt.files.read_text(ref=ref)
+                except Exception:
+                    continue
+                text = data.get("text", "") if isinstance(data, dict) else ""
+                entry["realExt"] = extract_real_ext(text) if text else ""
+        groups.extend(scan_work(work_dir, entries, scorer_rules))
     return groups
 
 
-def _now() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+def _store_groups(ctx: Any, run_id: str, groups: list[dict[str, Any]]) -> int:
+    stored = 0
+    for seq, group in enumerate(groups[:MAX_GROUPS_STORED]):
+        if _storage_set(ctx, f"scans/{run_id}/groups/{seq:04d}", _compact_group(group)):
+            stored += 1
+    return stored
 
 
-def _collect_files(ctx: Context, ref: Any,
-                   ignores: List[str]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    offset = 0
-    limit = 100
-    while True:
-        try:
-            got = ctx.mt.tasks.items(ref=ref, offset=offset, limit=limit)
-        except Exception as exc:                               # noqa: BLE001
-            ctx.mt.log(level="warn", message="读取扫描结果页失败 offset=%d: %s"
-                       % (offset, exc))
-            break
-        items = got.get("items") or got.get("files") or [] if isinstance(got, dict) else []
-        if not items:
-            break
-        for it in items:
-            f = it.get("file") if isinstance(it, dict) and "file" in it else it
-            if not isinstance(f, dict):
-                continue
-            path = f.get("path") or ""
-            name = f.get("name") or posixpath.basename(path)
-            if not name.endswith(".strm"):
-                continue
-            if _is_ignored(path, ignores):
-                continue
-            out.append({
-                "path": path,
-                "name": name,
-                "ref": f.get("ref"),
-                "rootId": f.get("rootId") or (ref.get("rootId") if isinstance(ref, dict) else None),
+def _delete_via_files_batch(
+    ctx: Any, candidates: list[dict[str, Any]], purpose: str
+) -> dict[str, int]:
+    """用 files.batch delete 批量删除（fileRef 优先，destination 兜底）。
+
+    附带文件（.nfo / -mediainfo.json）先 files.stat 定位再列入同一批。
+    """
+    items: list[dict[str, Any]] = []
+    deleted = 0
+    skipped = 0
+    for cand in candidates[:DELETE_BATCH_LIMIT]:
+        ref = cand.get("ref") or ""
+        root_id = cand.get("rootId") or ""
+        rel = cand.get("rel") or ""
+        if ref:
+            items.append({"operation": "delete", "fileRef": ref})
+        elif root_id and rel:
+            items.append({
+                "operation": "delete",
+                "destination": {"rootId": root_id, "path": rel},
+                "recursive": False,
             })
-        offset = got.get("nextOffset") if isinstance(got, dict) else None
-        if not offset:
+        else:
+            skipped += 1
+            continue
+        for suffix in COMPANION_EXTS:
+            companion = rel + suffix if rel else ""
+            if not (root_id and companion):
+                continue
+            try:
+                stat = ctx.mt.files.stat(root_id=root_id, path=companion)
+            except Exception:
+                continue
+            if isinstance(stat, dict) and stat.get("ref") and not stat.get("isDir"):
+                items.append({"operation": "delete", "fileRef": stat["ref"]})
+    if items:
+        try:
+            result = ctx.mt.files.batch(
+                idempotency_key=_new_idempotency_key(ctx, purpose),
+                items=items[:DELETE_BATCH_LIMIT],
+            )
+            deleted = int(result.get("succeeded", len(items))) if isinstance(result, dict) else len(items)
+        except Exception as exc:
+            ctx.log.error(f"files.batch delete failed: {exc}")
+            skipped += len(items)
+    return {"deleted": deleted, "skipped": skipped, "requested": len(candidates)}
+
+
+def _collect_task_items(ctx: Any, ref: str) -> list[dict[str, Any]]:
+    """分页拉取异步任务的全部文件条目。"""
+    out: list[dict[str, Any]] = []
+    offset = 0
+    for _ in range(500):
+        try:
+            data = ctx.mt.tasks.items(ref=ref, offset=offset, limit=PAGE_SIZE)
+        except Exception:
             break
+        items = data.get("items", []) if isinstance(data, dict) else []
+        out.extend(items)
+        next_offset = data.get("nextOffset") if isinstance(data, dict) else None
+        if next_offset is None or next_offset <= offset:
+            break
+        offset = int(next_offset)
     return out
 
 
-def _read_strm_real_ext(ctx: Context, entry: Dict[str, Any]) -> str:
-    full = entry.get("full")
-    if full and os.path.isfile(full):
+# ---------------------------------------------------------------------------
+# 主插件
+# ---------------------------------------------------------------------------
+class Plugin(PluginBase):
+    def validate_config(self, config: dict[str, Any], ctx: Any = None) -> dict[str, Any] | None:
+        """纯校验：不调用任何 SDK（官方 validate_config 无 SDK 权限）。"""
+        errors: dict[str, str] = {}
+        if config is None:
+            return None
+        rule_id = config.get("ruleId")
+        if rule_id is not None and not isinstance(rule_id, str):
+            errors["ruleId"] = "规则 ID 必须是字符串"
+        for key in ("readStrmContent",):
+            value = config.get(key)
+            if value is not None and not isinstance(value, bool):
+                errors[key] = "必须是布尔值"
+        for key in ("scanSource", "toolSource"):
+            value = config.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                errors[key] = "必须是 {rootId, path} 对象"
+            elif not str(value.get("rootId") or "").strip():
+                errors[key] = "缺少 rootId"
+            elif str(value.get("path") or ".").startswith("/") or ".." in str(value.get("path") or ".").split("/"):
+                errors[key] = "path 须为相对 root 的路径"
+        return {"fieldErrors": errors} if errors else None
+
+    def on_init(self, ctx: Any) -> None:
+        # 只补缺失的配置镜像；不覆盖已有值（官方 on_init 语义）。
         try:
-            with open(full, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read(512)
-            ext = nameinfo.extract_real_ext(content)
-            if ext:
-                return ext
-        except Exception:                                      # noqa: BLE001
+            existing = _storage_get(ctx, KV_CONFIG, default=None)
+            if not isinstance(existing, dict):
+                _storage_set(ctx, KV_CONFIG, dict(DEFAULT_CONFIG))
+        except Exception:
             pass
 
-    ref = entry.get("ref")
-    root_id = entry.get("rootId")
-    rel = entry.get("rel")
-    if ref or (root_id and rel):
-        try:
-            kwargs = {"length": 512, "offset": 0}
-            if ref:
-                kwargs["ref"] = ref
-            else:
-                kwargs["root_id"] = root_id
-                kwargs["path"] = rel
-            chunk = ctx.mt.files.read(**kwargs)
-            if isinstance(chunk, dict):
-                chunk = chunk.get("data") or chunk.get("content") or b""
-            if isinstance(chunk, str):
-                chunk = chunk.encode("utf-8", errors="ignore")
-            content = chunk.decode("utf-8", errors="ignore")
-            ext = nameinfo.extract_real_ext(content)
-            if ext:
-                return ext
-        except Exception as exc:                               # noqa: BLE001
-            ctx.mt.log(level="debug", message="读取 strm 扩展名失败 (%s): %s" % (rel, exc))
-    return "strm"
+    def on_stop(self, ctx: Any) -> None:
+        pass
 
-
-def _work_dir_of(rel: str) -> Optional[str]:
-    norm = rel.replace("\\", "/").strip("/")
-    parts = norm.split("/")
-    if len(parts) < 2:
-        return None
-    for i in range(len(parts) - 1, 0, -1):
-        seg = parts[i - 1]
-        if workscan.parse_work_dir(seg):
-            return "/".join(parts[:i])
-    return parts[0]
-
-
-def _start_scan(ctx: Context, sel: Dict[str, str], idx: int, rid: str) -> Optional[str]:
-    root_id = sel["rootId"]
-    path = sel["path"]
-    try:
-        res = ctx.mt.files.scan(
-            root_id=root_id,
-            path=path,
-            max_scan_files=50000,
-            idempotency_key="%s-%s-%d" % (PLUGIN_ID, rid, idx),
+    # -- 页面（静态：不调 rules.list、不扫盘；绑定 state.*）--------------
+    def get_page(self, ctx: Any) -> dict[str, Any]:
+        cfg = _cfg_view(ctx)
+        # 宿主 run.* 只读：dup-scan 动作排队/运行中时按钮 loading+禁用+改文案
+        is_scan_running = ui.expr(
+            "and",
+            ui.expr("or", ui.expr("eq", ui.ref("run.action"), "dup-scan"),
+                    ui.expr("eq", ui.ref("run.action"), "dup-scan-collect")),
+            ui.expr("or", ui.expr("eq", ui.ref("run.status"), "queued"),
+                    ui.expr("eq", ui.ref("run.status"), "running")),
         )
-    except Exception as exc:                                   # noqa: BLE001
-        ctx.mt.log(level="error", message="files.scan 提交失败 [%s:%s]：%s"
-                   % (root_id, path, exc))
-        return None
-    task_id = res.get("taskId") or res.get("id") if isinstance(res, dict) else None
-    if not task_id:
-        ctx.mt.log(level="error", message="files.scan 未返回 taskId：%r" % res)
-        return None
-    ctx.mt.log(level="info", message="files.scan 任务已下发 [%s:%s] -> taskId=%s"
-               % (root_id, path, task_id))
-    return str(task_id)
+        is_tool_running = ui.expr(
+            "and",
+            ui.expr("or", ui.expr("eq", ui.ref("run.action"), "tool-scan-non-http"),
+                    ui.expr("eq", ui.ref("run.action"), "tool-scan-collect")),
+            ui.expr("or", ui.expr("eq", ui.ref("run.status"), "queued"),
+                    ui.expr("eq", ui.ref("run.status"), "running")),
+        )
+        # 真实规则下拉：options 绑 query.rules.data.ruleOptions（query 已做过滤/拼标签），
+        # fallback 保留 auto/内置默认，query 未加载时仍可点
+        fallback_options = [
+            {"label": "自动（首条启用评分规则）", "value": "auto"},
+            {"label": "内置默认评分", "value": "built-in-default"},
+            {"label": "电影-外语", "value": "quality-movie"},
+            {"label": "电影-国语", "value": "quality-movie-zh"},
+            {"label": "剧集-外语", "value": "quality-strm-tv"},
+            {"label": "剧集-国语", "value": "quality-tv-zh"},
+            {"label": "本地strm", "value": "quality-strm"},
+        ]
+        rule_options = ui.expr("if", ui.ref("query.rules.data.ruleOptions"), ui.ref("query.rules.data.ruleOptions"), fallback_options)
+        children = [
+            ui.Text(text="STRM 重复查重", size="xl"),
+            ui.Text(text="选择扫描目录（DirectoryPicker 返回 {rootId, path}），扫描走宿主 files.scan 异步任务；结果按 scans/<runId>/groups 分页存储。", tone="muted"),
+            ui.DirectoryPicker(label="扫描目录", bind="state.source"),
+            ui.Select(label="查重规则", bind="state.ruleId", options=rule_options),
+            ui.Text(text=ui.ref("query.rules.data.currentRuleSummary"), tone="muted"),
+            ui.Text(text=ui.ref("query.rules.data.slotsStatusText"), tone="muted"),
+            ui.Checkbox(label="读取 STRM 首行做扩展名槽隔离", bind="state.readStrmContent"),
+            ui.Button(
+                label=ui.expr("if", is_scan_running, "⏳ 正在查重扫描中...", "开始查重"),
+                disabled=is_scan_running,
+                loading=is_scan_running,
+                onClick=[
+                    {"type": "invoke", "actionId": "dup-scan", "input": {"source": ui.ref("state.source"), "ruleId": ui.ref("state.ruleId")}},
+                    {"type": "query", "queryId": "summary"},
+                    {"type": "query", "queryId": "rules"},
+                ],
+            ),
+            ui.Text(text="扫描中…（files.scan 异步任务，收集完成后表格自动刷新）", visible=is_scan_running, tone="muted"),
+            ui.Table(
+                source=ui.ref("query.summary.data.items"),
+                columns=[
+                    {"label": "作品", "cells": [ui.Text(text=ui.ref("row.label"))]},
+                    {"label": "槽位", "cells": [ui.Text(text=ui.ref("row.slot"))]},
+                    {"label": "判定", "cells": [ui.Text(text=ui.ref("row.verdict"))]},
+                    {"label": "保留", "cells": [ui.Text(text=ui.ref("row.keep"))]},
+                    {"label": "删除", "cells": [ui.Text(text=ui.ref("row.drop"))]},
+                    {"label": "分差", "cells": [ui.Text(text=ui.ref("row.minDiff"))]},
+                ],
+                rowKey="key",
+                selectionBind="state.selected_wash_ids",
+            ),
+            ui.Button(
+                label="批量洗白（删除低分重复）",
+                onClick=[{"type": "invoke", "actionId": "batch-wash", "input": {"selections": ui.ref("state.selected_wash_ids")}}],
+            ),
+            ui.Button(
+                label="批量忽略（保留所选）",
+                onClick=[{"type": "invoke", "actionId": "batch-ignore", "input": {"selections": ui.ref("state.selected_wash_ids")}}],
+            ),
+        ]
+        # 扫描非 HTTP 单独成页：目录/按钮/结果区/统计都在 Tab 内
+        tool_tab = ui.Tab(
+            ui.Text(text="扫描 STRM 首行非 http/https（本地路径、相对路径、空文件等异常）", tone="muted"),
+            ui.DirectoryPicker(label="工具扫描目录", bind="state.tool_source"),
+            ui.Button(
+                label=ui.expr("if", is_tool_running, "⏳ 正在扫描非 HTTP...", "扫描非 HTTP 链接"),
+                disabled=is_tool_running,
+                loading=is_tool_running,
+                onClick=[
+                    {"type": "invoke", "actionId": "tool-scan-non-http", "input": {"source": ui.ref("state.tool_source")}},
+                    {"type": "query", "queryId": "summary"},
+                ],
+            ),
+            ui.Text(text=ui.ref("query.summary.data.toolSummary"), tone="muted"),
+            ui.Text(text="扫描中…（files.scan 异步任务，收集完成后结果区自动刷新）", visible=is_tool_running, tone="muted"),
+            ui.Table(
+                source=ui.ref("query.summary.data.toolItems"),
+                columns=[
+                    {"label": "序号", "cells": [ui.Text(text=ui.ref("row.seq"))]},
+                    {"label": "文件", "cells": [ui.Text(text=ui.ref("row.name"))]},
+                    {"label": "相对路径", "cells": [ui.Text(text=ui.ref("row.rel"))]},
+                    {"label": "首行（异常）", "cells": [ui.Text(text=ui.ref("row.url"))]},
+                    {"label": "异常类型", "cells": [ui.Text(text=ui.ref("row.reason"))]},
+                ],
+                rowKey="key",
+                selectionBind="state.selected_tool_ids",
+            ),
+            ui.Button(
+                label="删除所选异常文件",
+                onClick=[{"type": "invoke", "actionId": "tool-batch-delete", "input": {"selections": ui.ref("state.selected_tool_ids")}}],
+            ),
+            ui.Button(
+                label="清空异常结果",
+                onClick=[{"type": "invoke", "actionId": "tool-clear", "input": {}}, {"type": "query", "queryId": "summary"}],
+            ),
+            id="tab-tool",
+            label="🔧 扫描非 HTTP",
+        )
+        dup_tab = ui.Tab(*children, id="tab-dup", label="🎬 STRM 重复查重")
+        return ui.page(
+            ui.Tabs(dup_tab, tool_tab, bind="state.activeTab"),
+            state={
+                "activeTab": "tab-dup",
+                "source": cfg.get("scanSource"),
+                "tool_source": cfg.get("toolSource"),
+                "selected_tool_ids": [],
+                "ruleId": cfg.get("ruleId", "auto"),
+                "readStrmContent": cfg.get("readStrmContent", True),
+                "selected_wash_ids": [],
+                "busy": False,
+            },
+            queries=[{"id": "rules", "name": "rules"}, {"id": "summary", "name": "summary"}],
+        )
 
+    # -- Queries ---------------------------------------------------------
+    @query("rules")
+    def rules(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        """只返回查重相关的评分规则（过滤命名规则），供 Select options 绑定。"""
+        cfg = _cfg(ctx)
+        all_rules = load_all_rules(ctx) or list(DEFAULT_FALLBACK_RULES)
+        scoring_rules = [r for r in all_rules if isinstance(r, dict) and isinstance(r.get("scoring"), dict)]
+        if not scoring_rules:
+            scoring_rules = list(DEFAULT_FALLBACK_RULES)
+        rule_options = [{"label": f"{r.get('name') or r.get('id')}（{r.get('id')}）", "value": str(r.get("id"))}
+                        for r in scoring_rules if r.get("id")]
+        rule_options.insert(0, {"label": "自动（首条启用评分规则）", "value": "auto"})
+        _, chosen = _resolve_rules(ctx, cfg)
+        if isinstance(chosen, dict) and chosen:
+            scorer_rules, unsupported, _disabled = to_scorer_rules(chosen)
+            slots = scorer_rules.get("slots") or []
+            slot_names = [s.get("name") for s in slots if isinstance(s, dict) and s.get("name")]
+            current_summary = "生效规则：%s（%s）｜分差门槛 %s 分" % (
+                chosen.get("name") or chosen.get("id"), chosen.get("id"), scorer_rules.get("min_score_diff", 0))
+            slots_text = "槽位：%s%s" % (", ".join(slot_names) or "默认单版本",
+                                         ("（不支持维度：%s）" % ", ".join(unsupported)) if unsupported else "")
+        else:
+            current_summary, slots_text = "生效规则：内置默认", "槽位：默认单版本"
+        return {"items": scoring_rules, "ruleOptions": rule_options,
+                "currentRuleId": (chosen.get("id") if isinstance(chosen, dict) else "auto"),
+                "currentRuleSummary": current_summary, "slotsStatusText": slots_text}
 
-def _compact_file(f: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not f:
-        return None
-    return {
-        "rel": f.get("rel") or f.get("path") or "",
-        "name": f.get("name") or "",
-        "score": f.get("score", 0.0),
-        "detail": f.get("detail") or "",
-    }
+    @query("summary")
+    def summary(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        run_id = _storage_get(ctx, KV_CURRENT_SCAN, default=None)
+        if not run_id:
+            return {"items": [], "toolItems": [], "total": 0, "toolTotal": 0, "toolSummary": "非 HTTP 异常：0（未扫描或无异常）", "message": "未执行扫描"}
+        items = _storage_list(ctx, f"scans/{run_id}/groups/", LIST_LIMIT)
+        rows = []
+        for idx, item in enumerate(items[:100]):
+            group = item.get("value", item) if isinstance(item, dict) else {}
+            if not isinstance(group, dict):
+                continue
+            rows.append({
+                "key": f"{idx}",
+                "label": group.get("label") or group.get("workDir", ""),
+                "slot": group.get("slot", ""),
+                "verdict": group.get("verdict", ""),
+                "keep": ", ".join(group.get("keep", [])),
+                "drop": ", ".join(group.get("drop", [])),
+                "minDiff": group.get("minDiff", 0),
+                "name": "",
+                "url": "",
+            })
+        tool_items = _storage_list(ctx, f"scans/{run_id}/tool/", LIST_LIMIT)
+        tool_rows = []
+        for idx, item in enumerate(tool_items[:100]):
+            row = item.get("value", item) if isinstance(item, dict) else {}
+            if isinstance(row, dict):
+                url = row.get("url", "") or ""
+                low = url.lower()
+                if not url:
+                    reason = "空文件/无首行"
+                elif low.startswith("file://"):
+                    reason = "file:// 本地路径"
+                elif url.startswith("/") or (len(url) > 2 and url[1] == ":"):
+                    reason = "本地绝对路径"
+                elif low.startswith(("ftp://", "smb://", "nfs://", "rtsp://", "rtmp://")):
+                    reason = "非 HTTP 协议"
+                else:
+                    reason = "相对路径/其他非 HTTP"
+                tool_rows.append({
+                    "key": f"tool-{idx}", "seq": idx + 1,
+                    "name": row.get("name", ""), "rel": row.get("rel", ""),
+                    "url": url, "reason": reason, "ref": row.get("ref", ""),
+                })
+        scan_summary = _storage_get(ctx, f"scans/{run_id}/summary", default={})
+        total = scan_summary.get("storedGroups", len(items)) if isinstance(scan_summary, dict) else len(items)
+        tool_count = scan_summary.get("nonHttpCount", len(tool_rows)) if isinstance(scan_summary, dict) else len(tool_rows)
+        tool_summary = ("非 HTTP 异常：%s 个（%s）" % (tool_count, "、".join(sorted({r["reason"] for r in tool_rows})) or "未扫描")) if tool_rows else "非 HTTP 异常：0（未扫描或无异常）"
+        return {"items": rows, "toolItems": tool_rows, "total": total,
+                "toolTotal": tool_count, "toolSummary": tool_summary, "runId": run_id}
 
+    # -- Actions ---------------------------------------------------------
+    @action("save-config")
+    def save_config(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        payload = payload or {}
+        cfg = _cfg(ctx)
+        for key in CONFIG_KEYS:
+            if key in payload:
+                cfg[key] = payload[key]
+        cfg["readStrmContent"] = bool(cfg.get("readStrmContent", True))
+        if "scanSource" in payload:
+            cfg["scanSource"] = _clean_source(payload.get("scanSource"))
+        if "toolSource" in payload:
+            cfg["toolSource"] = _clean_source(payload.get("toolSource"))
+        _storage_set(ctx, KV_CONFIG, {k: cfg.get(k) for k in CONFIG_KEYS})
+        return {"ok": True, "config": {k: cfg.get(k) for k in CONFIG_KEYS}}
 
-def _compact_groups(groups: List[Dict[str, Any]], max_items: int = 400) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for g in groups[:max_items]:
-        out.append({
-            "id": g.get("id"),
-            "work": g.get("work"),
-            "work_title": g.get("work_title"),
-            "work_year": g.get("work_year"),
-            "season": g.get("season"),
-            "episode": g.get("episode"),
-            "slot": g.get("slot"),
-            "verdict": g.get("verdict"),
-            "diff": g.get("diff"),
-            "diff_text": g.get("diff_text"),
-            "winner": _compact_file(g.get("winner")),
-            "loser": _compact_file(g.get("loser")),
-            "candidates_count": g.get("candidates_count", 2),
+    @action("select-rule")
+    def select_rule(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        payload = payload or {}
+        rule_id = str(payload.get("ruleId") or "auto")
+        cfg = _cfg(ctx)
+        cfg["ruleId"] = rule_id
+        _storage_set(ctx, KV_CONFIG, cfg)
+        return {"ok": True, "ruleId": rule_id}
+
+    @action("dup-clear")
+    def dup_clear(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        run_id = _storage_get(ctx, KV_CURRENT_SCAN, default=None)
+        if run_id:
+            for item in _storage_list(ctx, f"scans/{run_id}/groups/", LIST_LIMIT):
+                try:
+                    ctx.mt.storage.delete(key=item.get("key", ""))
+                except Exception:
+                    pass
+            _storage_set(ctx, f"scans/{run_id}/summary", {"state": "cleared"})
+        _storage_set(ctx, KV_CURRENT_SCAN, None)
+        return {"ok": True}
+
+    @action("dup-scan")
+    def dup_scan(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        payload = payload or {}
+        cfg = _cfg(ctx)
+        source = _clean_source(payload.get("source")) or cfg.get("scanSource")
+        if source is None:
+            raise ValueError("请先在页面选择有效的扫描目录（DirectoryPicker）")
+        if payload.get("ruleId"):
+            cfg["ruleId"] = str(payload["ruleId"])
+        if "readStrmContent" in payload:
+            cfg["readStrmContent"] = bool(payload["readStrmContent"])
+        _persist_sources(ctx, cfg, source=source)
+        _storage_set(ctx, KV_CONFIG, {k: cfg.get(k) for k in CONFIG_KEYS})
+        run_id = f"scan-{uuid.uuid4().hex[:12]}"
+        task = ctx.mt.files.scan(
+            root_id=source["rootId"],
+            path=source["path"],
+            video_only=False,  # ⚠️ .strm 非视频容器，True 会被宿主过滤掉（已验证）
+            limit=SCAN_LIMIT,
+            idempotency_key=_new_idempotency_key(ctx, f"dup-scan:{run_id}"),
+        )
+        ref = task.get("ref") if isinstance(task, dict) else None
+        if not ref:
+            raise RuntimeError("files.scan 未返回任务引用")
+        _storage_set(ctx, f"scans/{run_id}/summary", {
+            "state": "running", "rootId": source["rootId"], "path": source["path"],
+            "taskRef": ref, "config": {k: cfg[k] for k in CONFIG_KEYS},
         })
-    return out
+        _storage_set(ctx, KV_CURRENT_SCAN, run_id)
+        ctx.mt.tasks.wait(
+            refs=[ref],
+            completion={"action": "dup-scan-collect", "input": {"runId": run_id}},
+        )
+        return {"waiting": True}
+
+    @continuation("dup-scan-collect")
+    def dup_scan_collect(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        run_id = (payload or {}).get("runId") or _storage_get(ctx, KV_CURRENT_SCAN, default="")
+        task_refs = []
+        try:
+            tasks = (ctx.data.get("tasks", []) if isinstance(getattr(ctx, "data", None), dict) else [])
+            task_refs = [t.get("ref") for t in tasks if isinstance(t, dict) and t.get("ref")]
+        except Exception:
+            task_refs = []
+        summary = _storage_get(ctx, f"scans/{run_id}/summary", default={}) or {}
+        cfg = summary.get("config") or _cfg(ctx)
+        read_content = bool(cfg.get("readStrmContent", True))
+        all_rules, _chosen = _resolve_rules(ctx, cfg)
+        works: dict[str, list[dict[str, Any]]] = {}
+        strm_count = 0
+        for ref in task_refs:
+            for item in _collect_task_items(ctx, ref):
+                file = item.get("file") or {}
+                name = file.get("name", "")
+                if not name.lower().endswith(".strm") or file.get("isDir"):
+                    continue
+                strm_count += 1
+                rel = file.get("path", name)
+                work_dir = _work_dir_of(rel)
+                works.setdefault(work_dir, []).append({
+                    "rel": rel, "name": name,
+                    "ref": file.get("ref", ""), "version": file.get("version", ""),
+                    "rootId": file.get("rootId", summary.get("rootId", "")),
+                })
+        groups = _evaluate_works(ctx, works, _chosen if isinstance(_chosen, dict) and _chosen else all_rules, read_content)
+        stored = _store_groups(ctx, run_id, groups)
+        stats = summarize(groups)
+        _storage_set(ctx, f"scans/{run_id}/summary", {
+            "state": "done", "rootId": summary.get("rootId", ""), "path": summary.get("path", ""),
+            "strmCount": strm_count, "works": len(works),
+            "storedGroups": stored, "stats": stats,
+        })
+        ctx.log.info(f"dup-scan 完成：strm={strm_count} works={len(works)} groups={stored}")
+        return {"ok": True, "runId": run_id, "storedGroups": stored, "stats": stats}
+
+    @action("tool-scan-non-http")
+    def tool_scan_non_http(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        payload = payload or {}
+        cfg_t = _cfg(ctx)
+        source = _clean_source(payload.get("source")) or cfg_t.get("toolSource")
+        if source is None:
+            raise ValueError("请先选择工具扫描目录（DirectoryPicker）")
+        _persist_sources(ctx, cfg_t, tool_source=source)
+        _storage_set(ctx, KV_CONFIG, {k: cfg_t.get(k) for k in CONFIG_KEYS})
+        run_id = _storage_get(ctx, KV_CURRENT_SCAN, default=None) or f"scan-{uuid.uuid4().hex[:12]}"
+        _storage_set(ctx, KV_CURRENT_SCAN, run_id)
+        _existing = _storage_get(ctx, f"scans/{run_id}/summary", default={}) or {}
+        if not isinstance(_existing, dict) or not _existing:
+            _storage_set(ctx, f"scans/{run_id}/summary", {"state": "running", "rootId": source["rootId"], "path": source["path"], "nonHttpCount": 0})
+        task = ctx.mt.files.scan(
+            root_id=source["rootId"],
+            path=source["path"],
+            video_only=False,  # ⚠️ 同上：.strm 必须 video_only=False
+            limit=SCAN_LIMIT,
+            idempotency_key=_new_idempotency_key(ctx, f"tool-scan:{run_id}"),
+        )
+        ref = task.get("ref") if isinstance(task, dict) else None
+        if not ref:
+            raise RuntimeError("files.scan 未返回任务引用")
+        ctx.mt.tasks.wait(
+            refs=[ref],
+            completion={"action": "tool-scan-collect", "input": {"runId": run_id}},
+        )
+        return {"waiting": True}
+
+    @continuation("tool-scan-collect")
+    def tool_scan_collect(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        run_id = (payload or {}).get("runId") or _storage_get(ctx, KV_CURRENT_SCAN, default="")
+        task_refs = []
+        try:
+            tasks = (ctx.data.get("tasks", []) if isinstance(getattr(ctx, "data", None), dict) else [])
+            task_refs = [t.get("ref") for t in tasks if isinstance(t, dict) and t.get("ref")]
+        except Exception:
+            task_refs = []
+        rows: list[dict[str, Any]] = []
+        for ref in task_refs:
+            for item in _collect_task_items(ctx, ref):
+                file = item.get("file") or {}
+                name = file.get("name", "")
+                if not name.lower().endswith(".strm") or file.get("isDir"):
+                    continue
+                try:
+                    data = ctx.mt.files.read_text(ref=file.get("ref", ""))
+                except Exception:
+                    continue
+                text = data.get("text", "") if isinstance(data, dict) else ""
+                url = text.splitlines()[0].strip() if text else ""
+                if url and not url.lower().startswith(("http://", "https://")):
+                    rows.append({
+                        "name": name, "url": url,
+                        "ref": file.get("ref", ""), "version": file.get("version", ""),
+                        "rootId": file.get("rootId", ""), "rel": file.get("path", name),
+                    })
+        for seq, row in enumerate(rows[:MAX_TOOL_ROWS]):
+            _storage_set(ctx, f"scans/{run_id}/tool/{seq:04d}", row)
+        _prev = _storage_get(ctx, f"scans/{run_id}/summary", default={}) or {}
+        if isinstance(_prev, dict):
+            _prev["nonHttpCount"] = len(rows)
+            _storage_set(ctx, f"scans/{run_id}/summary", _prev)
+        ctx.log.info(f"tool-scan 完成：非 HTTP strm={len(rows)}")
+        return {"ok": True, "runId": run_id, "nonHttpCount": len(rows)}
+
+    def _load_groups(self, ctx: Any) -> tuple[str, list[dict[str, Any]]]:
+        run_id = _storage_get(ctx, KV_CURRENT_SCAN, default=None) or ""
+        groups: list[dict[str, Any]] = []
+        if run_id:
+            for item in _storage_list(ctx, f"scans/{run_id}/groups/", LIST_LIMIT):
+                value = item.get("value", item) if isinstance(item, dict) else {}
+                if isinstance(value, dict):
+                    groups.append(value)
+        return run_id, groups
+
+    @action("batch-wash")
+    def batch_wash(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        payload = payload or {}
+        selections = payload.get("selections") or []
+        run_id, groups = self._load_groups(ctx)
+        candidates: list[dict[str, Any]] = []
+        selected = set(str(s) for s in selections) if selections else None
+        for idx, group in enumerate(groups):
+            if selected is not None and str(idx) not in selected:
+                continue
+            drop = set(group.get("drop", []))
+            if not drop:
+                continue
+            for file in group.get("files", []):
+                if file.get("name") in drop or file.get("rel") in drop:
+                    candidates.append(file)
+        result = _delete_via_files_batch(ctx, candidates, "batch-wash")
+        ctx.log.info(f"batch-wash run={run_id} {result}")
+        return {"ok": True, **result}
+
+    @action("batch-ignore")
+    def batch_ignore(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        # 保留所选：仅记录，不删除（与旧版行为一致，无文件系统副作用）。
+        selections = (payload or {}).get("selections") or []
+        ctx.log.info(f"batch-ignore 保留 {len(selections)} 项")
+        return {"ok": True, "ignored": len(selections)}
+
+    @action("manual-decide")
+    def manual_decide(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        payload = payload or {}
+        keep = payload.get("keep") or []
+        drop = payload.get("drop") or []
+        candidates = [
+            {"name": n, "rel": n, "ref": "", "rootId": ""} for n in drop
+        ]
+        # 手动删除同样走宿主删除接口；无 ref 时按名称无法定位则跳过。
+        runnable = [c for c in candidates if c.get("ref")]
+        result = _delete_via_files_batch(ctx, runnable, "manual-decide") if runnable else {
+            "deleted": 0, "skipped": len(candidates), "requested": len(candidates)}
+        return {"ok": True, "keep": keep, **result}
+
+    @action("tool-batch-delete")
+    def tool_batch_delete(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        payload = payload or {}
+        selections = payload.get("selections") or None
+        run_id = _storage_get(ctx, KV_CURRENT_SCAN, default=None) or ""
+        candidates: list[dict[str, Any]] = []
+        if run_id:
+            for idx, item in enumerate(_storage_list(ctx, f"scans/{run_id}/tool/", LIST_LIMIT)):
+                value = item.get("value", item) if isinstance(item, dict) else {}
+                if selections is not None and f"tool-{idx}" not in {str(x) for x in selections}:
+                    continue
+                if isinstance(value, dict) and value.get("ref"):
+                    candidates.append(value)
+        result = _delete_via_files_batch(ctx, candidates, "tool-batch-delete")
+        return {"ok": True, **result}
+
+    @action("tool-delete-single")
+    def tool_delete_single(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        payload = payload or {}
+        ref = payload.get("ref") or payload.get("fileRef") or ""
+        if not ref:
+            raise ValueError("缺少文件引用 ref")
+        result = ctx.mt.files.delete(
+            file_ref=ref, idempotency_key=_new_idempotency_key(ctx, "tool-delete-single"))
+        return {"ok": True, "result": result}
+
+    @action("tool-clear")
+    def tool_clear(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        run_id = _storage_get(ctx, KV_CURRENT_SCAN, default=None) or ""
+        if run_id:
+            for item in _storage_list(ctx, f"scans/{run_id}/tool/", LIST_LIMIT):
+                try:
+                    ctx.mt.storage.delete(key=item.get("key", ""))
+                except Exception:
+                    pass
+        return {"ok": True}
+
+    # 兼容旧版存储键别名（只读迁移提示，不再写入）。
+    KV_GROUPS = "groups"
+    KV_META = "meta"
+    KV_TOOL_STRMS = "tool_local_strms"
+    KV_TOOL_META = "tool_meta"
 
 
-def _row(g: Dict[str, Any]) -> Dict[str, Any]:
-    winner = g.get("winner") or {}
-    loser = g.get("loser") or {}
-
-    season = g.get("season")
-    episode = g.get("episode")
-    slot = g.get("slot")
-    if season is not None and episode is not None:
-        label = "S%02dE%02d" % (season, episode)
-    elif slot:
-        label = str(slot)
-    else:
-        label = "电影"
-
-    title = g.get("work_title") or g.get("work") or ""
-    year = g.get("work_year")
-    if year:
-        title = "%s (%s)" % (title, year)
-
-    diff_val = g.get("diff", 0.0)
-    diff_str = ("+%.2f" % diff_val) if diff_val > 0 else "0.00"
-
-    w_score = winner.get("score")
-    l_score = loser.get("score")
-    w_label = winner.get("name") or winner.get("rel") or "—"
-    l_label = loser.get("name") or loser.get("rel") or "—"
-    if w_score is not None:
-        w_label = "%s (%.2f分)" % (w_label, w_score)
-    if l_score is not None:
-        l_label = "%s (%.2f分)" % (l_label, l_score)
-
-    return {
-        "id": g.get("id") or "",
-        "title": title,
-        "label": label,
-        "diff": diff_str,
-        "diffText": g.get("diff_text") or ("分差 %s" % diff_str),
-        "keep": w_label,
-        "drop": l_label,
-        "keepRel": winner.get("rel") or "",
-        "dropRel": loser.get("rel") or "",
-        "dir": _short_dir(g.get("work") or ""),
-    }
-
-
-def _short_dir(p: str) -> str:
-    norm = p.replace("\\", "/").strip("/")
-    parts = norm.split("/")
-    if len(parts) <= 3:
-        return norm
-    return ".../" + "/".join(parts[-2:])
+plugin = Plugin()  # 宿主按 plugin.py:Plugin 加载

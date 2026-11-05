@@ -65,6 +65,13 @@ def to_scorer_rules(rule: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], Li
       disabled_dims：MT 里本就 enabled=false 的维度（不算问题）
     """
     rule = rule or {}
+    if isinstance(rule.get("definition"), dict):
+        base = dict(rule["definition"])
+        for k in ("id", "entry_id", "name", "entry_name", "enabled"):
+            if k in rule and k not in base:
+                base[k] = rule[k]
+        rule = base
+
     scoring_in = rule.get("scoring") or {}
     scoring: Dict[str, Dict[str, Any]] = {}
     unsupported: List[str] = []
@@ -109,9 +116,9 @@ def to_scorer_rules(rule: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], Li
             "codecs": list(exclude_in.get("codecs") or []),
             "hdr_types": list(exclude_in.get("hdrTypes") or exclude_in.get("hdr_types") or []),
         },
-        "slots": list(ver.get("slots") or []),
-        "unmatched": ver.get("unmatched") or "best",
-        "version_enabled": bool(ver.get("enabled", True)),
+        "slots": list(ver.get("slots") or rule.get("slots") or []),
+        "unmatched": ver.get("unmatched") or rule.get("unmatched") or "best",
+        "version_enabled": bool(ver.get("enabled", rule.get("version_enabled", True))),
     }
     return rules, unsupported, disabled
 
@@ -138,3 +145,145 @@ def weights_table(rules: Dict[str, Any]) -> List[Dict[str, Any]]:
         })
     rows.sort(key=lambda r: -(r.get("weight") or 0))
     return rows
+
+
+DEFAULT_FALLBACK_RULES = [
+    {
+        "id": "quality-movie",
+        "name": "电影-外语",
+        "min_score_diff": 8,
+        "version": {
+            "enabled": True,
+            "slots": [
+                {"name": "ISO", "match": {"file_extension": ["iso"]}},
+                {"name": "normal", "match": {"resolution": ["2160p", "1080p", "1080i", "720p"]}},
+            ],
+        },
+        "scoring": {
+            "resolution": {"enabled": True, "weight": 20, "priority": ["2160p", "1080p", "1080i", "720p"]},
+            "video_codec": {"enabled": True, "weight": 10, "priority": ["H.265", "H.264", "AV1", "VP9"]},
+            "hdr": {"enabled": True, "weight": 40, "priority": ["Dolby Vision P7", "Dolby Vision", "HDR10+", "HDR10", "HLG", "SDR"]},
+            "bitrate": {"enabled": True, "weight": 25},
+        },
+    },
+    {
+        "id": "quality-movie-zh",
+        "name": "电影-国语",
+        "min_score_diff": 8,
+        "version": {
+            "enabled": True,
+            "slots": [
+                {"name": "ISO", "match": {"file_extension": ["iso"]}},
+                {"name": "normal", "match": {"resolution": ["2160p", "1080p", "1080i", "720p"]}},
+            ],
+        },
+        "scoring": {
+            "resolution": {"enabled": True, "weight": 20, "priority": ["2160p", "1080p", "1080i", "720p"]},
+            "video_codec": {"enabled": True, "weight": 10, "priority": ["H.265", "H.264", "AV1", "VP9"]},
+            "hdr": {"enabled": True, "weight": 40, "priority": ["Dolby Vision P7", "Dolby Vision", "HDR10+", "HDR10", "HLG", "SDR"]},
+            "bitrate": {"enabled": True, "weight": 25},
+        },
+    },
+    {
+        "id": "quality-strm-tv",
+        "name": "剧集-外语",
+        "min_score_diff": 8,
+        "version": {"enabled": True, "slots": []},
+        "scoring": {
+            "resolution": {"enabled": True, "weight": 20, "priority": ["2160p", "1080p", "1080i", "720p"]},
+            "video_codec": {"enabled": True, "weight": 10, "priority": ["H.265", "H.264", "AV1", "VP9"]},
+            "hdr": {"enabled": True, "weight": 40, "priority": ["Dolby Vision P7", "Dolby Vision", "HDR10+", "HDR10", "HLG", "SDR"]},
+            "bitrate": {"enabled": True, "weight": 25},
+        },
+    },
+    {
+        "id": "quality-tv-zh",
+        "name": "剧集-国语",
+        "min_score_diff": 8,
+        "version": {"enabled": True, "slots": []},
+        "scoring": {
+            "resolution": {"enabled": True, "weight": 20, "priority": ["2160p", "1080p", "1080i", "720p"]},
+            "video_codec": {"enabled": True, "weight": 10, "priority": ["H.265", "H.264", "AV1", "VP9"]},
+            "hdr": {"enabled": True, "weight": 40, "priority": ["Dolby Vision P7", "Dolby Vision", "HDR10+", "HDR10", "HLG", "SDR"]},
+            "bitrate": {"enabled": True, "weight": 25},
+        },
+    },
+    {
+        "id": "quality-strm",
+        "name": "本地strm",
+        "min_score_diff": 0,
+        "version": {
+            "enabled": True,
+            "slots": [{"name": "ISO", "match": {"file_extension": ["iso"]}}],
+        },
+        "scoring": {
+            "resolution": {"enabled": True, "weight": 20, "priority": ["2160p", "1080p", "1080i", "720p"]},
+            "video_codec": {"enabled": True, "weight": 10, "priority": ["H.265", "H.264", "AV1", "VP9"]},
+            "hdr": {"enabled": True, "weight": 40, "priority": ["Dolby Vision P7", "Dolby Vision", "HDR10+", "HDR10", "HLG", "SDR"]},
+            "bitrate": {"enabled": True, "weight": 25},
+        },
+    },
+]
+
+
+def load_all_rules(ctx=None) -> List[Dict[str, Any]]:
+    """读取 MediaTidy 系统中定义的所有质量评分规则，优先使用官方 SDK。"""
+    if ctx is not None and hasattr(ctx, "mt") and hasattr(ctx.mt, "rules"):
+        try:
+            if hasattr(ctx.mt.rules, "list"):
+                res = ctx.mt.rules.list()
+                if callable(res):
+                    res = res()
+                items = res if isinstance(res, list) else (res.get("items") or res.get("data") or [])
+                if items:
+                    normalized = []
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        if isinstance(it.get("definition"), dict):
+                            d = dict(it["definition"])
+                            d.setdefault("id", it.get("id"))
+                            d.setdefault("name", it.get("name"))
+                            d.setdefault("enabled", it.get("enabled", True))
+                            normalized.append(d)
+                        else:
+                            normalized.append(it)
+                    if normalized:
+                        return normalized
+        except Exception:
+            pass
+
+    return list(DEFAULT_FALLBACK_RULES)
+
+
+def get_rule_by_id(rule_id: str, ctx=None) -> Optional[Dict[str, Any]]:
+    """根据 ID 获取评分规则对象，匹配不到返回 None。"""
+    if not rule_id:
+        return None
+    rid = str(rule_id).strip()
+
+    # 优先使用官方 SDK rules.get
+    if ctx is not None and hasattr(ctx, "mt") and hasattr(ctx.mt, "rules"):
+        try:
+            if hasattr(ctx.mt.rules, "get"):
+                res = ctx.mt.rules.get(id=rid)
+                if callable(res):
+                    res = res()
+                data = res if isinstance(res, dict) else (res.get("data") or {})
+                if data and str(data.get("id")) == rid:
+                    if isinstance(data.get("definition"), dict):
+                        d = dict(data["definition"])
+                        d.setdefault("id", data.get("id"))
+                        d.setdefault("name", data.get("name"))
+                        d.setdefault("enabled", data.get("enabled", True))
+                        return d
+                    return data
+        except Exception:
+            pass
+
+    rules = load_all_rules(ctx=ctx)
+    for r in rules:
+        if str(r.get("id")) == rid:
+            return r
+    return None
+
