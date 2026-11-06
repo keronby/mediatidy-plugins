@@ -369,9 +369,10 @@ class Plugin(PluginBase):
         pass
 
     # -- 页面（静态：不调 rules.list、不扫盘；绑定 state.*）--------------
+    # 风格对齐 media.series-dedup：Alert 提示 + Section 分块 + Card/Metric 统计 + Stack 横排按钮
     def get_page(self, ctx: Any) -> dict[str, Any]:
         cfg = _cfg_view(ctx)
-        # 宿主 run.* 只读：dup-scan 动作排队/运行中时按钮 loading+禁用+改文案
+        # 宿主 run.* 只读：动作排队/运行中时按钮 loading+禁用+改文案
         is_scan_running = ui.expr(
             "and",
             ui.expr("or", ui.expr("eq", ui.ref("run.action"), "dup-scan"),
@@ -386,8 +387,7 @@ class Plugin(PluginBase):
             ui.expr("or", ui.expr("eq", ui.ref("run.status"), "queued"),
                     ui.expr("eq", ui.ref("run.status"), "running")),
         )
-        # 真实规则下拉：options 绑 query.rules.data.ruleOptions（query 已做过滤/拼标签），
-        # fallback 保留 auto/内置默认，query 未加载时仍可点
+        running = ui.expr("or", is_scan_running, is_tool_running)
         fallback_options = [
             {"label": "自动（首条启用评分规则）", "value": "auto"},
             {"label": "内置默认评分", "value": "built-in-default"},
@@ -398,86 +398,139 @@ class Plugin(PluginBase):
             {"label": "本地strm", "value": "quality-strm"},
         ]
         rule_options = ui.expr("if", ui.ref("query.rules.data.ruleOptions"), ui.ref("query.rules.data.ruleOptions"), fallback_options)
-        children = [
-            ui.Text(text="STRM 重复查重", size="xl"),
-            ui.Text(text="选择扫描目录（DirectoryPicker 返回 {rootId, path}），扫描走宿主 files.scan 异步任务；结果按 scans/<runId>/groups 分页存储。", tone="muted"),
+
+        dup_settings = ui.Section(
             ui.DirectoryPicker(label="扫描目录", bind="state.source"),
             ui.Select(label="查重规则", bind="state.ruleId", options=rule_options),
-            ui.Text(text=ui.ref("query.rules.data.currentRuleSummary"), tone="muted"),
-            ui.Text(text=ui.ref("query.rules.data.slotsStatusText"), tone="muted"),
             ui.Checkbox(label="读取 STRM 首行做扩展名槽隔离", bind="state.readStrmContent"),
-            ui.Button(
-                label=ui.expr("if", is_scan_running, "⏳ 正在查重扫描中...", "开始查重"),
-                disabled=is_scan_running,
-                loading=is_scan_running,
-                onClick=[
-                    {"type": "invoke", "actionId": "dup-scan", "input": {"source": ui.ref("state.source"), "ruleId": ui.ref("state.ruleId")}},
-                    {"type": "query", "queryId": "summary"},
-                    {"type": "query", "queryId": "rules"},
-                ],
+            ui.Stack(
+                ui.Button(
+                    label=ui.expr("if", is_scan_running, "⏳ 正在查重扫描中...", "开始查重"),
+                    variant="default",
+                    disabled=is_scan_running,
+                    loading=is_scan_running,
+                    onClick=[
+                        {"type": "invoke", "actionId": "dup-scan", "input": {"source": ui.ref("state.source"), "ruleId": ui.ref("state.ruleId")}},
+                        {"type": "query", "queryId": "summary"},
+                        {"type": "query", "queryId": "rules"},
+                    ],
+                ),
+                ui.Button(
+                    label="刷新页面",
+                    variant="ghost",
+                    onClick=[{"type": "query", "queryId": "summary"}, {"type": "query", "queryId": "rules"}],
+                ),
+                direction="row", gap="sm",
             ),
-            ui.Text(text="扫描中…（files.scan 异步任务，收集完成后表格自动刷新）", visible=is_scan_running, tone="muted"),
+            title="扫描设置",
+        )
+        dup_overview = ui.Section(
+            ui.Card(
+                ui.Text(text=ui.ref("query.rules.data.currentRuleSummary")),
+                ui.Text(text=ui.ref("query.rules.data.slotsStatusText"), tone="muted", size="sm"),
+                ui.Text(text=ui.ref("query.summary.data.overviewLine")),
+                title="统计指标",
+            ),
+            title="查重与比对概览",
+        )
+        dup_actions = ui.Section(
+            ui.Alert(text="⏳ 正在后台扫描，按钮已锁定…", tone="warning", visible=running),
+            ui.Stack(
+                ui.Button(
+                    label="批量洗白（删除低分重复）",
+                    variant="outline",
+                    onClick=[{"type": "invoke", "actionId": "batch-wash", "input": {"selections": ui.ref("state.selected_wash_ids")}}],
+                ),
+                ui.Button(
+                    label="批量忽略（保留所选）",
+                    variant="ghost",
+                    onClick=[{"type": "invoke", "actionId": "batch-ignore", "input": {"selections": ui.ref("state.selected_wash_ids")}}],
+                ),
+                direction="row", gap="sm",
+            ),
+            title="操作控制台",
+        )
+        dup_table = ui.Section(
             ui.Table(
                 source=ui.ref("query.summary.data.items"),
                 columns=[
-                    {"label": "作品", "cells": [ui.Text(text=ui.ref("row.label"))]},
-                    {"label": "槽位", "cells": [ui.Text(text=ui.ref("row.slot"))]},
-                    {"label": "判定", "cells": [ui.Text(text=ui.ref("row.verdict"))]},
-                    {"label": "保留", "cells": [ui.Text(text=ui.ref("row.keep"))]},
-                    {"label": "删除", "cells": [ui.Text(text=ui.ref("row.drop"))]},
-                    {"label": "分差", "cells": [ui.Text(text=ui.ref("row.minDiff"))]},
+                    {"label": "作品", "field": "label", "cells": [ui.Text(text=ui.ref("row.label"))]},
+                    {"label": "槽位", "field": "slot", "cells": [ui.Text(text=ui.ref("row.slot"))]},
+                    {"label": "判定", "field": "verdict", "cells": [ui.Text(text=ui.ref("row.verdict"))]},
+                    {"label": "保留", "field": "keep", "cells": [ui.Text(text=ui.ref("row.keep"))]},
+                    {"label": "删除", "field": "drop", "cells": [ui.Text(text=ui.ref("row.drop"))]},
+                    {"label": "分差", "field": "minDiff", "cells": [ui.Text(text=ui.ref("row.minDiff"))]},
                 ],
                 rowKey="key",
                 selectionBind="state.selected_wash_ids",
             ),
-            ui.Button(
-                label="批量洗白（删除低分重复）",
-                onClick=[{"type": "invoke", "actionId": "batch-wash", "input": {"selections": ui.ref("state.selected_wash_ids")}}],
-            ),
-            ui.Button(
-                label="批量忽略（保留所选）",
-                onClick=[{"type": "invoke", "actionId": "batch-ignore", "input": {"selections": ui.ref("state.selected_wash_ids")}}],
-            ),
-        ]
-        # 扫描非 HTTP 单独成页：目录/按钮/结果区/统计都在 Tab 内
-        tool_tab = ui.Tab(
-            ui.Text(text="扫描 STRM 首行非 http/https（本地路径、相对路径、空文件等异常）", tone="muted"),
+            title="重复结果明细",
+        )
+        dup_tab = ui.Tab(dup_settings, dup_overview, dup_actions, dup_table, id="tab-dup", label="🎬 STRM 重复查重")
+
+        tool_settings = ui.Section(
             ui.DirectoryPicker(label="工具扫描目录", bind="state.tool_source"),
-            ui.Button(
-                label=ui.expr("if", is_tool_running, "⏳ 正在扫描非 HTTP...", "扫描非 HTTP 链接"),
-                disabled=is_tool_running,
-                loading=is_tool_running,
-                onClick=[
-                    {"type": "invoke", "actionId": "tool-scan-non-http", "input": {"source": ui.ref("state.tool_source")}},
-                    {"type": "query", "queryId": "summary"},
-                ],
+            ui.Stack(
+                ui.Button(
+                    label=ui.expr("if", is_tool_running, "⏳ 正在扫描非 HTTP...", "扫描非 HTTP 链接"),
+                    variant="default",
+                    disabled=is_tool_running,
+                    loading=is_tool_running,
+                    onClick=[
+                        {"type": "invoke", "actionId": "tool-scan-non-http", "input": {"source": ui.ref("state.tool_source")}},
+                        {"type": "query", "queryId": "summary"},
+                    ],
+                ),
+                ui.Button(
+                    label="刷新页面",
+                    variant="ghost",
+                    onClick=[{"type": "query", "queryId": "summary"}],
+                ),
+                direction="row", gap="sm",
             ),
-            ui.Text(text=ui.ref("query.summary.data.toolSummary"), tone="muted"),
-            ui.Text(text="扫描中…（files.scan 异步任务，收集完成后结果区自动刷新）", visible=is_tool_running, tone="muted"),
+            title="扫描设置",
+        )
+        tool_overview = ui.Section(
+            ui.Card(
+                ui.Text(text=ui.ref("query.summary.data.toolSummary")),
+                title="统计指标",
+            ),
+            title="异常概览",
+        )
+        tool_actions = ui.Section(
+            ui.Alert(text="⏳ 正在后台扫描，按钮已锁定…", tone="warning", visible=running),
+            ui.Stack(
+                ui.Button(
+                    label="删除所选异常文件",
+                    variant="outline",
+                    onClick=[{"type": "invoke", "actionId": "tool-batch-delete", "input": {"selections": ui.ref("state.selected_tool_ids")}}],
+                ),
+                ui.Button(
+                    label="清空异常结果",
+                    variant="ghost",
+                    onClick=[{"type": "invoke", "actionId": "tool-clear", "input": {}}, {"type": "query", "queryId": "summary"}],
+                ),
+                direction="row", gap="sm",
+            ),
+            title="操作控制台",
+        )
+        tool_table = ui.Section(
             ui.Table(
                 source=ui.ref("query.summary.data.toolItems"),
                 columns=[
-                    {"label": "序号", "cells": [ui.Text(text=ui.ref("row.seq"))]},
-                    {"label": "文件", "cells": [ui.Text(text=ui.ref("row.name"))]},
-                    {"label": "相对路径", "cells": [ui.Text(text=ui.ref("row.rel"))]},
-                    {"label": "首行（异常）", "cells": [ui.Text(text=ui.ref("row.url"))]},
-                    {"label": "异常类型", "cells": [ui.Text(text=ui.ref("row.reason"))]},
+                    {"label": "序号", "field": "seq", "cells": [ui.Text(text=ui.ref("row.seq"))]},
+                    {"label": "文件", "field": "name", "cells": [ui.Text(text=ui.ref("row.name"))]},
+                    {"label": "相对路径", "field": "rel", "cells": [ui.Text(text=ui.ref("row.rel"))]},
+                    {"label": "首行（异常）", "field": "url", "cells": [ui.Text(text=ui.ref("row.url"))]},
+                    {"label": "异常类型", "field": "reason", "cells": [ui.Text(text=ui.ref("row.reason"))]},
                 ],
                 rowKey="key",
                 selectionBind="state.selected_tool_ids",
             ),
-            ui.Button(
-                label="删除所选异常文件",
-                onClick=[{"type": "invoke", "actionId": "tool-batch-delete", "input": {"selections": ui.ref("state.selected_tool_ids")}}],
-            ),
-            ui.Button(
-                label="清空异常结果",
-                onClick=[{"type": "invoke", "actionId": "tool-clear", "input": {}}, {"type": "query", "queryId": "summary"}],
-            ),
-            id="tab-tool",
-            label="🔧 扫描非 HTTP",
+            title="非 HTTP 异常明细",
         )
-        dup_tab = ui.Tab(*children, id="tab-dup", label="🎬 STRM 重复查重")
+        tool_tab = ui.Tab(tool_settings, tool_overview, tool_actions, tool_table, id="tab-tool", label="🔧 扫描非 HTTP")
+
         return ui.page(
             ui.Tabs(dup_tab, tool_tab, bind="state.activeTab"),
             state={
@@ -492,6 +545,7 @@ class Plugin(PluginBase):
             },
             queries=[{"id": "rules", "name": "rules"}, {"id": "summary", "name": "summary"}],
         )
+
 
     # -- Queries ---------------------------------------------------------
     @query("rules")
@@ -524,7 +578,7 @@ class Plugin(PluginBase):
     def summary(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
         run_id = _storage_get(ctx, KV_CURRENT_SCAN, default=None)
         if not run_id:
-            return {"items": [], "toolItems": [], "total": 0, "toolTotal": 0, "toolSummary": "非 HTTP 异常：0（未扫描或无异常）", "message": "未执行扫描"}
+            return {"items": [], "toolItems": [], "total": 0, "toolTotal": 0, "overviewLine": "尚未扫描", "toolSummary": "非 HTTP 异常：0（未扫描或无异常）", "message": "未执行扫描"}
         items = _storage_list(ctx, f"scans/{run_id}/groups/", LIST_LIMIT)
         rows = []
         for idx, item in enumerate(items[:100]):
@@ -568,8 +622,9 @@ class Plugin(PluginBase):
         total = scan_summary.get("storedGroups", len(items)) if isinstance(scan_summary, dict) else len(items)
         tool_count = scan_summary.get("nonHttpCount", len(tool_rows)) if isinstance(scan_summary, dict) else len(tool_rows)
         tool_summary = ("非 HTTP 异常：%s 个（%s）" % (tool_count, "、".join(sorted({r["reason"] for r in tool_rows})) or "未扫描")) if tool_rows else "非 HTTP 异常：0（未扫描或无异常）"
+        overview_line = "共 %d 组重复判定（%d 条明细）" % (total, len(rows)) if rows else "本次未发现重复组"
         return {"items": rows, "toolItems": tool_rows, "total": total,
-                "toolTotal": tool_count, "toolSummary": tool_summary, "runId": run_id}
+                "toolTotal": tool_count, "overviewLine": overview_line, "toolSummary": tool_summary, "runId": run_id}
 
     # -- Actions ---------------------------------------------------------
     @action("save-config")
