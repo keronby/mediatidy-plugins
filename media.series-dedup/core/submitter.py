@@ -38,7 +38,7 @@ def to_mt_path(local_path: str, link_type: str = "http", cloudnas_path: str = ""
         if strm_sub:
             if not strm_sub.startswith("/"):
                 strm_sub = "/" + strm_sub
-            return strm_sub if strm_sub.startswith("/115open") else f"/115open{strm_sub}"
+            return strm_sub
 
         return clean_p
 

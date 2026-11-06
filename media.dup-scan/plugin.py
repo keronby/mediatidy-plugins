@@ -3,7 +3,7 @@
 
 重构要点（对齐官方 Wiki SDK v2）：
 - 扫描默认走**本地快路径**（学 media.series-dedup）：宿主授权根为
-  local 且根名为 strm 时，直接在容器内 /strm（或宿主 /vol1/1000/strm）
+  local 且根名为 strm 时，直接在容器内 /strm（宿主挂载点由部署决定）
   用 os.walk 遍历，绕过宿主 files.scan/tasks.items 的逐文件审计/RPC，
   50w+ 库只需秒级；云盘根（storageType=cloud）自动回退到
   ctx.mt.files.scan（异步任务）+ tasks.wait + @continuation 分页
@@ -36,7 +36,7 @@ from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, t
 from core.workscan import parse_work_dir, scan_work, summarize
 
 MANIFEST_ID = "media.dup-scan"
-PLUGIN_VERSION = "1.3.3"
+PLUGIN_VERSION = "1.3.4"
 
 KV_CONFIG = "config"
 KV_CURRENT_SCAN = "currentScan"
@@ -414,18 +414,121 @@ def _evaluate_works(
             buckets.setdefault(key, []).append(e)
         keep_entries = [e for bucket in buckets.values() if len(bucket) >= 2 for e in bucket]
         if keep_entries:
+            # 预解析缓存：候选条目 full parse 一次（供 _evaluate_prepared 评分复用）
+            for e in keep_entries:
+                if e.get("_info") is None:
+                    e["_info"] = parse_strm_name(e["name"])
             candidates[work_dir] = keep_entries
+    # 查到重了才评分：委托 _evaluate_prepared（读内容 -> 槽位分组 -> <2 跳过 -> 打分）
+    return _evaluate_prepared(ctx, candidates, scorer_rules, read_content)
+
+
+_SCORE_DIM_FIELDS = (
+    ("resolution", "resolution"), ("video_codec", "videoCodec"),
+    ("hdr", "hdr"), ("source", "source"), ("audio_codec", "audioCodec"),
+    ("color_depth", "colorDepth"), ("frame_rate", "frameRate"),
+)
+
+
+def _score_entries(
+    entries: list[dict[str, Any]],
+    scorer_rules: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """对候选桶打分：复用预解析缓存，文件名维度命中后停止，避免无谓 RPC/parse。
+
+    评分字段优先取 entry["_info"]（_evaluate_prepared 已预解析，含真实扩展名修正）；
+    scoring.score 内部仍按维度权重 × 位置分计算，与 scan_work._score_files 同口径。
+    """
+    from core import scoring as _scoring
+    from core.workscan import _attach_snake, _slot_of  # noqa: PLC0415
+
+    slots = scorer_rules.get("slots") or []
+    out: list[dict[str, Any]] = []
+    for e in entries:
+        info = e.get("_info")
+        if not isinstance(info, dict):
+            info = parse_strm_name(e["name"], real_ext=e.get("realExt"))
+        sn = _attach_snake(info)
+        sc, _why = _scoring.score(sn, scorer_rules)
+        slot = _slot_of(info, slots)
+        out.append({"entry": e, "info": info, "score": sc, "slot": slot})
+    return out
+
+
+def _evaluate_prepared(
+    ctx: Any,
+    candidates: dict[str, list[dict[str, Any]]],
+    scorer_rules: dict[str, Any],
+    read_content: bool,
+) -> list[dict[str, Any]]:
+    """先查重、后读内容、最后评分（用户口径 m01746）。
+
+    流程：候选桶已由 _evaluate_works 按文件名（季/集或同目录）分好 →
+    只对桶内条目读 STRM 首行取真实扩展名（ISO 槽）→ 按槽位分组 →
+    每槽文件数 <2 直接跳过不评分 → 剩下的才 _score_entries 打分比对。
+    2万文件场景：预筛 0.1s + 候选桶读首行 + 极少数评分，远低于逐文件全量 parse。
+    """
+    from core.workscan import _decide, _file_dict, parse_work_dir  # noqa: PLC0415
+    import posixpath
+
     groups: list[dict[str, Any]] = []
     total = len(candidates)
+    min_diff = float(scorer_rules.get("min_score_diff") or 0)
     for done, work_dir in enumerate(sorted(candidates), 1):
         entries = candidates[work_dir]
+        if done % 500 == 0 or done == total:
+            _progress(ctx, done, f"查重比对 {done}/{total}", total)
+        # 1) 读内容（仅候选桶，不全量）
         if read_content:
             for entry in entries:
                 text = _read_first_line(ctx, entry)
                 entry["realExt"] = extract_real_ext(text) if text else ""
-        groups.extend(scan_work(work_dir, entries, scorer_rules))
-        if done % 500 == 0 or done == total:
-            _progress(ctx, done, f"查重比对 {done}/{total}", total)
+                # 槽位修正后需重解析 fileExtension，缓存失效则重 parse 一次
+                if entry.get("_info") is not None and entry["realExt"]:
+                    entry["_info"] = parse_strm_name(entry["name"], real_ext=entry["realExt"])
+        # 2) 预解析（候选才 full parse，缓存供评分复用）
+        for entry in entries:
+            if entry.get("_info") is None:
+                entry["_info"] = parse_strm_name(entry["name"], real_ext=entry.get("realExt"))
+        # 3) 按槽位分组（与 scan_work 同口径：剧集 (slot,季,集)、电影 (slot,)）
+        #    is_tv 由预筛 _info 的 episode 推断，避免重复 parse
+        is_tv = any((entry.get("_info") or {}).get("episode") is not None for entry in entries)
+        slots_map: dict[Any, list[dict[str, Any]]] = {}
+        work = parse_work_dir(posixpath.basename(work_dir.rstrip("/"))) or {}
+        for entry in entries:
+            info = entry["_info"]
+            slot = __import__("core.workscan", fromlist=["_slot_of"])._slot_of(info, scorer_rules.get("slots") or [])
+            ep, season = info.get("episode"), info.get("season")
+            if is_tv:
+                if ep is None or info.get("isMulti"):
+                    continue
+                key = (slot, season, ep)
+            else:
+                key = (slot,)
+            slots_map.setdefault(key, []).append(entry)
+        for key, items in slots_map.items():
+            if len(items) < 2:
+                continue  # 查到不重：该槽只有 1 个文件，不评分不建组
+            scored = _score_entries(items, scorer_rules)
+            # 组装 _File 兼容 _decide（其入参为 _File 对象列表，取 score/slot）
+            from core.workscan import _File  # noqa: PLC0415
+            files = [_File(it["entry"].get("rel",""), it["entry"].get("name",""), it["info"], it["score"], [], it["slot"]) for it in scored]
+            keep, drop, verdict, diff = _decide(files, min_diff)
+            if verdict == "none":
+                continue
+            slot = key[0]
+            label = ("S%02dE%02d" % (key[1] or 0, key[2] or 0)) if is_tv and len(key) == 3 else "单片"
+            groups.append({
+                "workDir": work_dir, "tmdb": work.get("tmdb"), "title": work.get("title"),
+                "year": work.get("year"), "kind": "tv" if is_tv else "movie",
+                "slot": slot, "label": label,
+                "season": key[1] if is_tv and len(key) == 3 else None,
+                "episode": key[2] if is_tv and len(key) == 3 else None,
+                "verdict": verdict, "minDiff": min_diff, "diff": round(diff, 2),
+                "keep": _file_dict(keep) if keep else None,
+                "drop": _file_dict(drop) if drop else None,
+                "files": [_file_dict(f) for f in sorted(files, key=lambda f: -f.score)],
+            })
     return groups
 
 
@@ -553,7 +656,7 @@ def _delete_by_content(
         else:
             # 本地链接：STRM 内容就是媒体文件真实路径（如 /CloudNAS/...mkv，CD2 挂载）。
             # 用户 m01513 纠正：直接删该媒体文件即可，CD2 grpc 会同步删云端；
-            # 不在 .strm 同目录找同名文件，也不走 /strm->/小小玻珠 地址映射（那是整理 destDir 用的）。
+            # 不在 .strm 同目录找同名文件，也不走地址映射（那是整理 destDir 用的）。
             # 同时删 .strm 本体 + 同名 .nfo/-mediainfo.json，避免重复项残留。
             content_path = (text or "").strip()
             # 容器内 /CloudNAS 已挂载；宿主 /vol1/1000 前缀在容器内不存在，归一后优先原路径

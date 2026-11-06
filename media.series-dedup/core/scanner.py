@@ -22,7 +22,7 @@ def resolve_local_path(path: Optional[str] = None) -> str:
     """路径映射解析：兼容宿主路径与容器路径。"""
     p = (path or "").strip()
     if not p:
-        p = "/strm/云盘影视/电视剧"
+        p = "/strm"
 
     if os.path.exists(p):
         return p
@@ -111,7 +111,7 @@ def analyze_strm_files(dir_path: str) -> Tuple[str, str, int]:
 
             if first_line.startswith("http://") or first_line.startswith("https://"):
                 types_found.add("http")
-            elif any(k in first_line for k in ["/cloudnas", "/vol1", "/115open", "CloudNAS"]):
+            elif any(k in first_line for k in ["/cloudnas", "/vol1", "CloudNAS"]):
                 types_found.add("cloudnas")
                 if not sample_cloudnas_dir:
                     # 提取云盘目录路径（去掉文件名）
