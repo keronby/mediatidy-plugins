@@ -6,10 +6,11 @@ python3 - "$N" <<'PY'
 import json, sys, requests
 n = int(sys.argv[1])
 s = requests.Session()
-tok = s.post("http://127.0.0.1:2019/api/auth/login",
-             json={"username": "admin", "password": "fuck0000"}, timeout=30).json()["data"]["token"]
+import os
+tok = s.post(os.environ.get("MT_BASE","http://127.0.0.1:2019/api")+"/auth/login",
+             json={"username": os.environ.get("MT_USER","admin"), "password": os.environ.get("MT_PASSWORD","")}, timeout=30).json()["data"]["token"]
 s.headers["Authorization"] = "Bearer " + tok
-it = s.get("http://127.0.0.1:2019/api/plugins/media.dup-scan/logs", timeout=60).json().get("data", {}).get("items", [])
+it = s.get(os.environ.get("MT_BASE","http://127.0.0.1:2019/api")+"/plugins/media.dup-scan/logs", timeout=60).json().get("data", {}).get("items", [])
 for x in it[:n]:
     print("[%s] %s" % (x.get("level"), x.get("message")))
 PY

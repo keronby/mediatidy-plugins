@@ -6,11 +6,11 @@ from core import nameinfo, rules as rulelib, workscan
 class TestExtAndSlot(unittest.TestCase):
     def test_extract_real_ext(self):
         # 1. 本地/云盘路径
-        p1 = "/CloudNAS/CloudDrive/115open/电影/茶之味.2004.1080p.iso"
+        p1 = "/CloudNAS/media/茶之味.2004.1080p.iso"
         self.assertEqual(nameinfo.extract_real_ext(p1), "iso")
 
         # 2. 带 query fileName 的 URL
-        p2 = "http://192.168.10.207:2019/api/shareVideoPlayUrl?accountId=3&fileName=%E8%8C%B6%E4%B9%8B%E5%91%B3.2004.1080p.mkv&password=9535"
+        p2 = "https://example.com/shareVideoPlayUrl?fileName=tea.mkv"
         self.assertEqual(nameinfo.extract_real_ext(p2), "mkv")
 
         # 3. 纯 URL

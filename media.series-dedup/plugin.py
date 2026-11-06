@@ -28,11 +28,11 @@ STORAGE_KEY_FULL_GROUPS = "series_dedup_full_groups"
 
 DEFAULT_CONFIG = {
     "debugMode": True,  # 默认只读调试模式
-    "rootPath": "/strm/云盘影视/电视剧",
-    "localProfileId": "1359",
-    "localDestDir": "/strm/云盘影视",
-    "cloudProfileId": "854",
-    "cloudDestDir": "/小小玻珠/云盘影视",
+    "rootPath": "",
+    "localProfileId": "",
+    "localDestDir": "",
+    "cloudProfileId": "",
+    "cloudDestDir": "",
     "forceRefreshTmdb": True,
 }
 
@@ -278,10 +278,10 @@ class Plugin(PluginBase):
         evaluated = match_duplicate_groups(
             groups,
             caches,
-            local_profile_id=int(cfg.get("localProfileId", 1359)),
-            local_dest_dir=cfg.get("localDestDir", "/strm/云盘影视"),
-            cloud_profile_id=int(cfg.get("cloudProfileId", 854)),
-            cloud_dest_dir=cfg.get("cloudDestDir", "/小小玻珠/云盘影视"),
+            local_profile_id=int(cfg.get("localProfileId") or 0),
+            local_dest_dir=cfg.get("localDestDir", ""),
+            cloud_profile_id=int(cfg.get("cloudProfileId") or 0),
+            cloud_dest_dir=cfg.get("cloudDestDir", ""),
         )
 
         diff_groups_cnt = sum(1 for g in evaluated if g.get("has_diff"))

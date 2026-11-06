@@ -50,9 +50,9 @@ def match_duplicate_groups(
     groups: List[Dict[str, Any]],
     tmdb_caches: Dict[int, Dict[str, Any]],
     local_profile_id: int = 1359,
-    local_dest_dir: str = "/strm/云盘影视",
+    local_dest_dir: str = "",
     cloud_profile_id: int = 854,
-    cloud_dest_dir: str = "/小小玻珠/云盘影视"
+    cloud_dest_dir: str = ""
 ) -> List[Dict[str, Any]]:
     """对扫描出的重复组进行比对，标记差异与分流建议。"""
     evaluated_groups = []

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""media.dup-scan — STRM 重复查重（MT Python SDK v2，1.3.1）
+"""media.dup-scan — STRM 重复查重（MT Python SDK v2，1.3.2）
 
 重构要点（对齐官方 Wiki SDK v2）：
 - 扫描默认走**本地快路径**（学 media.series-dedup）：宿主授权根为
@@ -35,7 +35,7 @@ from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, t
 from core.workscan import parse_work_dir, scan_work, summarize
 
 MANIFEST_ID = "media.dup-scan"
-PLUGIN_VERSION = "1.3.1"
+PLUGIN_VERSION = "1.3.2"
 
 KV_CONFIG = "config"
 KV_CURRENT_SCAN = "currentScan"
@@ -54,10 +54,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "readStrmContent": True,
     "scanSource": None,   # {rootId, path}，上次选择的查重扫描目录
     "toolSource": None,   # {rootId, path}，上次选择的工具扫描目录
-    # 本地/网盘地址映射（series-dedup 同款语义，无预设值，用户自填；m01513 后删除不再用映射，保留供后续整理用）
-    # 例：localDestDir=/strm/云盘影视  cloudDestDir=/小小玻珠/云盘影视
-    "localDestDir": "",
-    "cloudDestDir": "",
 }
 CONFIG_KEYS = tuple(DEFAULT_CONFIG.keys())
 
@@ -468,7 +464,6 @@ def _classify_strm_url(text: str) -> str:
 
 def _delete_by_content(
     ctx: Any, candidates: list[dict[str, Any]], purpose: str,
-    local_dest: str = "", cloud_dest: str = "",
 ) -> dict[str, int]:
     """按 STRM 内容分组删除（用户 m01409 需求 2，m01513 纠正本地分支）：
       - http(s) 分享：删 .strm 本体 + 同名 .nfo + 同名 -mediainfo.json；
@@ -630,10 +625,6 @@ class Plugin(PluginBase):
             value = config.get(key)
             if value is not None and not isinstance(value, bool):
                 errors[key] = "必须是布尔值"
-        for key in ("localDestDir", "cloudDestDir"):
-            value = config.get(key)
-            if value is not None and not isinstance(value, str):
-                errors[key] = "必须是字符串"
         for key in ("scanSource", "toolSource"):
             value = config.get(key)
             if value is None:
@@ -693,8 +684,6 @@ class Plugin(PluginBase):
             ui.DirectoryPicker(label="扫描目录", bind="state.source"),
             ui.Select(label="查重规则", bind="state.ruleId", options=rule_options),
             ui.Checkbox(label="读取 STRM 首行做扩展名槽隔离", bind="state.readStrmContent"),
-            ui.Input(label="本地目录（映射，如 /strm/云盘影视）", type="text", bind="state.localDestDir"),
-            ui.Input(label="网盘目录（映射，如 /小小玻珠/云盘影视）", type="text", bind="state.cloudDestDir"),
             ui.Stack(
                 ui.Button(
                     label=ui.expr("if", is_scan_running, "⏳ 正在查重扫描中...", "开始查重"),
@@ -702,7 +691,7 @@ class Plugin(PluginBase):
                     disabled=is_scan_running,
                     loading=is_scan_running,
                     onClick=[
-                        {"type": "invoke", "actionId": "dup-scan", "input": {"source": ui.ref("state.source"), "ruleId": ui.ref("state.ruleId"), "localDestDir": ui.ref("state.localDestDir"), "cloudDestDir": ui.ref("state.cloudDestDir")}},
+                        {"type": "invoke", "actionId": "dup-scan", "input": {"source": ui.ref("state.source"), "ruleId": ui.ref("state.ruleId")}},
                         {"type": "query", "queryId": "summary"},
                         {"type": "query", "queryId": "rules"},
                     ],
@@ -834,8 +823,6 @@ class Plugin(PluginBase):
                 "selected_tool_ids": [],
                 "ruleId": cfg.get("ruleId", "auto"),
                 "readStrmContent": cfg.get("readStrmContent", True),
-                "localDestDir": cfg.get("localDestDir", "") or "",
-                "cloudDestDir": cfg.get("cloudDestDir", "") or "",
                 "selected_wash_ids": [],
                 "busy": False,
             },
@@ -942,9 +929,6 @@ class Plugin(PluginBase):
             if key in payload:
                 cfg[key] = payload[key]
         cfg["readStrmContent"] = bool(cfg.get("readStrmContent", True))
-        for _mk in ("localDestDir", "cloudDestDir"):
-            if _mk in payload and isinstance(payload[_mk], str):
-                cfg[_mk] = payload[_mk].strip()
         if "scanSource" in payload:
             cfg["scanSource"] = _clean_source(payload.get("scanSource"))
         if "toolSource" in payload:
@@ -985,9 +969,6 @@ class Plugin(PluginBase):
             cfg["ruleId"] = str(payload["ruleId"])
         if "readStrmContent" in payload:
             cfg["readStrmContent"] = bool(payload["readStrmContent"])
-        for _mk in ("localDestDir", "cloudDestDir"):
-            if _mk in payload and isinstance(payload[_mk], str) and payload[_mk].strip():
-                cfg[_mk] = payload[_mk].strip()
         _persist_sources(ctx, cfg, source=source)
         _storage_set(ctx, KV_CONFIG, {k: cfg.get(k) for k in CONFIG_KEYS})
         run_id = f"scan-{uuid.uuid4().hex[:12]}"
@@ -1237,9 +1218,7 @@ class Plugin(PluginBase):
                         f["rootId"] = root_id
                         f["_localPath"] = os.path.join(local_base, f["rel"])
                     candidates.append(f)
-        result = _delete_by_content(ctx, candidates, "batch-wash",
-                                    local_dest=cfg.get("localDestDir", "") or "",
-                                    cloud_dest=cfg.get("cloudDestDir", "") or "")
+        result = _delete_by_content(ctx, candidates, "batch-wash")
         _log(ctx, "info", f"batch-wash run={run_id} {result}")
         return {"ok": True, **result}
 

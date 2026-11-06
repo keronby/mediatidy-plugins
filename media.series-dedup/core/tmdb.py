@@ -13,10 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 logger = logging.getLogger("media-series-dedup")
 
 # MT 默认数据库路径（只读模式）
-MT_DB_PATH = "/vol1/1000/docker/mediatidy/data/mediatidy.db"
+MT_DB_PATH = os.environ.get("MT_DB_PATH", "/data/mediatidy.db")  # 部署时按实际 MT 数据库路径覆盖
 MT_BASE_URL = "http://127.0.0.1:2019"
 MT_DEFAULT_USER = "admin"
-MT_DEFAULT_PASS = "fuck0000"
+MT_DEFAULT_PASS = os.environ.get("MT_PASSWORD", "")
 
 
 class MTClient:

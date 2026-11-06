@@ -25,8 +25,7 @@
     {
       "key": "rootPath",
       "label": "扫描根目录",
-      "type": "text",
-      "default": "/strm/云盘影视/电视剧"
+      "type": "text"
     },
     {
       "key": "localProfileId",
@@ -37,8 +36,7 @@
     {
       "key": "localDestDir",
       "label": "本地整理目标目录",
-      "type": "text",
-      "default": "/strm/云盘影视"
+      "type": "text"
     },
     {
       "key": "cloudProfileId",
@@ -49,8 +47,7 @@
     {
       "key": "cloudDestDir",
       "label": "云盘整理目标目录",
-      "type": "text",
-      "default": "/小小玻珠/云盘影视"
+      "type": "text"
     },
     {
       "key": "forceRefreshTmdb",
@@ -74,7 +71,9 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "scanPath": { "type": "string" }
+          "scanPath": {
+            "type": "string"
+          }
         },
         "additionalProperties": true
       },
@@ -110,7 +109,9 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "category": { "type": "string" }
+          "category": {
+            "type": "string"
+          }
         },
         "additionalProperties": true
       },

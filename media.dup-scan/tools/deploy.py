@@ -11,7 +11,7 @@ import json, os, sys, time, requests
 
 MT = os.environ.get("MT_BASE", "http://127.0.0.1:2019/api")
 USER = os.environ.get("MT_USER", "admin")
-PWD = os.environ.get("MT_PASSWORD", "fuck0000")
+PWD = os.environ.get("MT_PASSWORD", "")
 PLUGIN = "media.dup-scan"
 ROOT = "/strm"          # 容器内路径！宿主 /vol1/1000/strm 在 mediatidy 里不存在
 
@@ -60,4 +60,4 @@ def main(zip_path):
     print("rules:", json.dumps(q, ensure_ascii=False)[:300])
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "dist", "media.dup-scan-1.3.1.zip"))
+    main(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "dist", "media.dup-scan-1.3.2.zip"))

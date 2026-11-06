@@ -1,65 +1,37 @@
-# MediaTidy 插件集 (MediaTidy Plugins)
+# MediaTidy Plugins
 
-本项目为 **[MediaTidy (MT)](https://github.com/murongyun8/MediaTidy)** 专用的第三方增强插件集，致力于为影视收藏爱好者与 NAS 用户提供高性能、安全、智能的媒体查重与洗版管理工具。
+[MediaTidy](https://github.com/murongyun8/MediaTidy) 第三方插件集（Python SDK v2），共 3 个插件。
 
----
+## 插件
 
-## 📦 插件列表
+| 插件 ID | 名称 | 版本 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `media.dup-scan` | STRM 重复扫描 | 1.3.2 | 在作品目录内扫描重复 `.strm`，按 MediaTidy 质量评分规则（`总分 = Σ(weight × 位置分)`，与 MT 同口径）与多版本槽位（ISO / 普通、DV / HDR 等）识别应保留 / 应删除版本。本地根走 `os.walk` 快路径（50w+ 库秒级），云盘根走宿主 `files.scan` 异步任务。删除按 STRM 内容分组：`http(s)` 分享删 `.strm` + 同名 `.nfo` + `-mediainfo.json`；本地链接直接删 STRM 内容指向的媒体文件路径（CD2 挂载，同步删云端），同时删 `.strm` 本体与附带文件。 |
+| `media.series-dedup` | 剧集查重（影视重整分流） | 1.0.0 | 按 TMDB ID 扫描电影 / 电视剧目录，比对 TMDB 最新标题 / 年份，按 STRM 链接属性（分享链 / 云盘链 / 混合链）自动分流重整任务。扫描根、整理方案 ID、目标目录均在插件配置中填写，无硬编码预设。 |
+| `media.sweep` | 整理清道夫 | 1.4.1 | MT 整理后的清扫环节：用本地 sha1 归约库比对云盘未识别目录，视频全部命中的作品视为已整理并整包删除，未命中的原地保留；其余文件交 AI 识别（原生搜索 → 公开资料搜索 → 纯文件名三级降级）后交 MT 整理。零第三方依赖。 |
 
-| 插件名称 | 插件 ID | 版本 | 适用媒体 | 核心特性 |
-| :--- | :--- | :--- | :--- | :--- |
-| **媒体查重** | `media.dup-scan` | `v1.0.0` | 电影 / 单篇作品 | 双方案智能分流、ISO原盘安全隔离、MT原生评分、极速扫描 |
-| **剧集查重** | `media.series-dedup` | `v1.0.0` | 电视剧 / 动漫 / 多季剧集 | 按剧集/季度聚合、跨版本清晰度对比、剧集级安全去重 |
+## 安装（插件中心 / 集合包）
 
----
+本仓库根目录 `plugins.json` 为 MediaTidy 插件集合索引（`schemaVersion: 1`），可直接在 MT 插件中心添加本仓库地址安装 / 更新全部插件；也可先用各插件 `tools/` 下的打包脚本（`pack_local.py` / `build.sh`）打出单插件 `.zip`，再在 MT「插件管理 → 安装插件」上传。
 
-## 🌟 插件详解
+## 部署脚本的环境变量（脱敏）
 
-### 1. 媒体查重 (`media.dup-scan`)
-专门针对电影及单篇媒体文件的查重与智能保留推荐引擎。
+`tools/deploy.py`、`tools/logs.sh`、`tools/reinstall.py` 等本地部署脚本不再硬编码任何账号密码、内网地址或站点专属根 ID，运行时通过环境变量传入：
 
-- **多路径双方案智能分流**：支持在后台「授权与配置」中分别配置**本地整理方案**与**分享整理方案（STRM）**。插件在扫描时会根据文件路径特征自动路由，无需在每次扫描时手动切换方案；
-- **ISO 原盘槽位安全隔离**：读取 `.strm` 首行解析真实文件扩展名（如 `.iso`）。系统将 ISO 原盘与通用流媒体（如 `.mkv`、`.mp4`）划分到不同槽位分别评分，杜绝因流媒体分差规则导致误判删除高规格原盘；
-- **对齐 MT 原生 10 倍放大评分引擎**：完全继承 MediaTidy 官方质量评分公式（$总分 = \sum (维度权重 \times 维度位置分)$），精确支持 `minScoreDiff` 胜出分差判定；
-- **极速 Fast Path 扫描**：对本地已授权目录绕过高延迟的逐个 stat 查询，实测万级媒体库秒级完成重复匹配；
-- **轻量紧凑存储**：对扫描结果实施结构精简与保护，彻底杜绝 256 KiB 存储溢出。
+- `MT_BASE`（默认 `http://127.0.0.1:2019/api`）
+- `MT_USER`（默认 `admin`）
+- `MT_PASSWORD`（必填，不设默认值）
+- `MT_DB_PATH`、`MT_CLOUD_ROOT_ID`、`MT_LOCAL_ROOT_ID`、`MT_DEPLOY_USER`（按部署环境覆盖）
 
-### 2. 剧集查重 (`media.series-dedup`)
-专门针对多季剧集、动漫等长篇连续媒体的查重与清洗管理插件。
+## 目录结构
 
-- **剧集层级聚合**：自动识别季（Season）与集（Episode），按剧集维度汇集全季版本；
-- **跨版本质量对比**：对比不同发布组/压制版本的分辨率、HDR 规格、码率与音轨；
-- **安全审定**：提供候选版本的保留推荐与人工审定，防止集数不齐被误删。
-
----
-
-## 🚀 安装指南
-
-### 方式一：从 Releases 下载离线包安装（推荐）
-1. 前往本仓库的 [Releases 页面](../../releases)；
-2. 下载所需插件的最新发布包：
-   - 媒体查重：`media.dup-scan-1.0.0.zip`
-   - 剧集查重：`media.series-dedup-1.0.0.zip`
-3. 打开 MediaTidy 网页后台，进入 **「系统设置」->「插件管理」**；
-4. 点击右上角 **「安装插件」**，上传下载好的 `.zip` 文件即可完成安装；
-5. 在「授权与配置」中选择所需的整理方案与质量规则，启用插件并进入工作台。
-
-### 方式二：源码打包
-如果您需要二次开发或自行打包：
-```bash
-# 克隆仓库
-git clone https://github.com/keronby/mediatidy-plugins.git
-cd mediatidy-plugins
-
-# 执行一键打包脚本（依赖 Docker 内置 Python 环境）
-bash build_all.sh
+```
+plugins.json          # 插件集合索引（3 个插件）
+media.dup-scan/       # STRM 重复扫描
+media.series-dedup/   # 剧集查重
+media.sweep/          # 整理清道夫
 ```
 
----
+## License
 
-## 📝 贡献与反馈
-- 欢迎提交 [Issues](../../issues) 报告 Bug 或提出新功能建议；
-- 欢迎提交 Pull Request 共同改进插件！
-
-## 📄 License
-MIT License
+MIT

@@ -1,3 +1,0 @@
-d60ac0cdc79fffb0f9a0abcb1d37c551ef5de8d1beb0fccb42b9fd2844fcd832  media.dup-scan-1.0.3.zip
-2f30e86256ad45a3eb96fd3baf0f5257039817f20ac5808b2e6d94028218284d  media.series-dedup-1.0.13.zip
-68838f02aaabca86510ca0cc8b192dbd9ceee7c4c4e3490b14ea01ffb7f9f342  media.series-dedup-1.0.14.zip

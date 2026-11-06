@@ -4,12 +4,12 @@ import sys
 import requests
 import subprocess
 
-MT = "http://127.0.0.1:2019/api"
+MT = os.environ.get("MT_BASE", "http://127.0.0.1:2019/api")
 PLUGIN_ID = "media.series-dedup"
 
 def get_auth_token():
     try:
-        r = requests.post(f"{MT}/auth/login", json={"username": "admin", "password": "fuck0000"}, timeout=10)
+        r = requests.post(f"{MT}/auth/login", json={"username": os.environ.get("MT_USER","admin"), "password": os.environ.get("MT_PASSWORD","")}, timeout=10)
         return r.json().get("data", {}).get("token")
     except Exception as e:
         print("登录获取 token 失败:", e)
