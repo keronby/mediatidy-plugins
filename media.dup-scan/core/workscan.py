@@ -101,20 +101,28 @@ class _File:
 
 def _score_files(rels: List[str], rules: Dict[str, Any],
                  names: Optional[Dict[str, str]] = None,
-                 ext_map: Optional[Dict[str, str]] = None) -> List[_File]:
+                 ext_map: Optional[Dict[str, str]] = None,
+                 info_map: Optional[Dict[str, Dict[str, Any]]] = None) -> List[_File]:
     """给一组文件打分。
 
     names 是由 rel → 文件名 的映射；缺省时用 rel 的 basename。
     ext_map 是由 rel → 真实扩展名 的映射（从 strm 内容提取）。
+    info_map 是由 rel → 预解析 info 的映射（调用方已 parse 过时复用，
+    避免候选文件重复 full parse）；缺失条目回退原 parse 路径。
     """
     slots = rules.get("slots") or []
     names = names or {}
     ext_map = ext_map or {}
+    info_map = info_map or {}
     out: List[_File] = []
     for rel in rels:
         name = names.get(rel) or posixpath.basename(rel)
         real_ext = ext_map.get(rel)
-        info = nameinfo.parse(name, real_ext=real_ext)
+        cached = info_map.get(rel)
+        if cached is not None and cached.get("_realExt") == (real_ext or ""):
+            info = {k: v for k, v in cached.items() if not k.startswith("_")}
+        else:
+            info = nameinfo.parse(name, real_ext=real_ext)
         sn = _attach_snake(info)
         sc, why = scoring.score(sn, rules)
         slot = _slot_of(info, slots)
@@ -163,15 +171,23 @@ def scan_work(work_dir: str, entries: Iterable[Dict[str, Any]],
     """
     min_diff = float(rules.get("min_score_diff") or 0)
     work = parse_work_dir(posixpath.basename(work_dir.rstrip("/"))) or {}
-    is_tv = any(nameinfo.parse(e["name"]).get("episode") is not None for e in entries)
 
     # 按 (槽位, 季, 集) 或 (槽位, 单片) 分组
+    # 单遍 parse：先全部 parse 并缓存，再由缓存判定 is_tv，避免 is_tv
+    # 预检 + 分组循环两次 full parse（候选作品集多时是主要 CPU 成本）。
     groups: Dict[Tuple, List[Dict[str, Any]]] = {}
 
+    info_map: Dict[str, Dict[str, Any]] = {}
+    parsed: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for e in entries:
         name = e["name"]
         real_ext = e.get("realExt")
         info = nameinfo.parse(name, real_ext=real_ext)
+        info_map[e["rel"]] = dict(info, _realExt=real_ext or "")
+        parsed.append((e, info))
+    is_tv = any(info.get("episode") is not None for _, info in parsed)
+
+    for e, info in parsed:
         slot = _slot_of(info, rules.get("slots") or [])
         ep = info.get("episode")
         season = info.get("season")
@@ -194,7 +210,7 @@ def scan_work(work_dir: str, entries: Iterable[Dict[str, Any]],
         rels = [it["rel"] for it in items]
         names = {it["rel"]: (it.get("name") or it["rel"]) for it in items}
         ext_map = {it["rel"]: it.get("realExt") for it in items if it.get("realExt")}
-        files = _score_files(rels, rules, names, ext_map=ext_map)
+        files = _score_files(rels, rules, names, ext_map=ext_map, info_map=info_map)
         keep, drop, verdict, diff = _decide(files, min_diff)
         if verdict == "none":
             continue
