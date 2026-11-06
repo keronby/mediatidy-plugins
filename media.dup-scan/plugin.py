@@ -189,6 +189,22 @@ def _compact_file(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _keep_drop_names(value: Any, files: list[dict[str, Any]], which: str) -> list[str]:
+    """keep/drop 在 scan_work 输出里是单个 file dict（或 None），不是列表。
+    统一归一为名字段列表，供 summary 展示 / batch_wash 匹配 / storage 存取。"""
+    if isinstance(value, list) and value and isinstance(value[0], str):
+        return list(value)
+    if isinstance(value, dict) and value:
+        name = value.get("name") or value.get("rel") or ""
+        return [str(name)] if name else []
+    if isinstance(value, list) and value and isinstance(value[0], dict):
+        return [str(f.get("name") or f.get("rel") or "") for f in value if f.get("name") or f.get("rel")]
+    # dict/None 兜底：从 files 首个推断（极少数旧存量）
+    if isinstance(value, list):
+        return list(value)
+    return []
+
+
 def _compact_group(group: dict[str, Any]) -> dict[str, Any]:
     files = [_compact_file(f) for f in group.get("files", [])]
     return {
@@ -203,8 +219,8 @@ def _compact_group(group: dict[str, Any]) -> dict[str, Any]:
         "verdict": group.get("verdict", ""),
         "minDiff": group.get("minDiff", group.get("min_diff", 0)),
         "diff": group.get("diff", 0),
-        "keep": group.get("keep", []),
-        "drop": group.get("drop", []),
+        "keep": _keep_drop_names(group.get("keep"), files, "keep"),
+        "drop": _keep_drop_names(group.get("drop"), files, "drop"),
         "files": files,
     }
 
@@ -737,8 +753,8 @@ class Plugin(PluginBase):
                 "label": group.get("label") or group.get("workDir", ""),
                 "slot": group.get("slot", ""),
                 "verdict": group.get("verdict", ""),
-                "keep": ", ".join(group.get("keep", [])),
-                "drop": ", ".join(group.get("drop", [])),
+                "keep": ", ".join(_keep_drop_names(group.get("keep"), group.get("files", []), "keep")),
+                "drop": ", ".join(_keep_drop_names(group.get("drop"), group.get("files", []), "drop")),
                 "minDiff": group.get("minDiff", 0),
                 "name": "",
                 "url": "",
