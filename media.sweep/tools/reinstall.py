@@ -13,6 +13,7 @@
      —— 本版走 MT 原生 files.* API，必须真的授权云盘根，否则 resolve_root 找不到根
 """
 import json
+import os
 import sys
 import time
 
@@ -28,27 +29,38 @@ CFG = {
     "prompt": "",
 }
 
-# 授权根：必须是完整的 root 对象（宿主校验 id/read/write/delete/storageType）
-# 云盘根名为「小小玻珠」
-ROOTS = [
-    {
-        "read": True, "write": True, "delete": True,
-        "id": "root-242c8625-6284-468a-bce5-0ce210ea1834",
-        "name": "小小玻珠", "path": "/小小玻珠", "storageType": "cloud",
-    },
-    {
-        "read": True, "write": False, "delete": False,
-        "id": "root-b4626435-631a-4982-a6ba-8083d745a821",
-        "name": "strm", "path": "/strm", "storageType": "local",
-    },
-]
+# 授权根：本地部署时从 env 注入（脱敏：仓库不含真实根 ID/名）。
+# MT_CLOUD_ROOT_ID / MT_LOCAL_ROOT_ID 必填，名称/路径可选。
+def _roots():
+    cloud_id = os.environ.get("MT_CLOUD_ROOT_ID", "")
+    local_id = os.environ.get("MT_LOCAL_ROOT_ID", "")
+    roots = []
+    if cloud_id:
+        roots.append({
+            "read": True, "write": True, "delete": True,
+            "id": cloud_id,
+            "name": os.environ.get("MT_CLOUD_ROOT_NAME", "cloud"),
+            "path": os.environ.get("MT_CLOUD_ROOT_PATH", "/cloud"),
+            "storageType": "cloud",
+        })
+    if local_id:
+        roots.append({
+            "read": True, "write": False, "delete": False,
+            "id": local_id,
+            "name": os.environ.get("MT_LOCAL_ROOT_NAME", "strm"),
+            "path": os.environ.get("MT_LOCAL_ROOT_PATH", "/strm"),
+            "storageType": "local",
+        })
+    return roots
+
+ROOTS = _roots()
 
 
 def login():
     s = requests.Session()
     s.headers["Authorization"] = "Bearer " + s.post(
         MT + "/auth/login",
-        json={"username": "admin", "password": "fuck0000"},
+        json={"username": os.environ.get("MT_USER", "admin"), "password": os.environ.get("MT_PASSWORD", "")},
         timeout=30,
     ).json()["data"]["token"]
     return s
