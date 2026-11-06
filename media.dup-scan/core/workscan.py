@@ -91,12 +91,14 @@ def _attach_snake(info: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class _File:
-    __slots__ = ("rel", "name", "info", "score", "why", "slot")
+    __slots__ = ("rel", "name", "info", "score", "why", "slot", "kind")
 
     def __init__(self, rel: str, name: str, info: Dict[str, Any],
-                 score: float, why: List[str], slot: str):
+                 score: float, why: List[str], slot: str, kind: str = ""):
         self.rel, self.name, self.info = rel, name, info
         self.score, self.why, self.slot = score, why, slot
+        # STRM 内容形态：http（分享链接）/ local（本地路径）/ ""（未知）
+        self.kind = kind or ""
 
 
 def _score_files(rels: List[str], rules: Dict[str, Any],
@@ -156,9 +158,19 @@ def _decide(files: List[_File], min_diff: float) -> Tuple[Optional[_File], Optio
     if not known:
         same = False
     if same and abs(diff) < 1e-9:
+        # 完全等价：若一方分享链接、一方本地路径，默认本地路径为失败者
+        # （用户口径：同分时本地路径失败，保留分享链接）。
+        if {best.kind, second.kind} == {"http", "local"}:
+            keeper, loser = (best, second) if best.kind == "http" else (second, best)
+            return keeper, loser, "keep", diff
         return best, second, "same", diff
     if diff >= min_diff:
         return best, second, "keep", diff
+    # 分差不足（tie）：同分/近平分时同样默认本地路径为失败者，
+    # 避免因解析不到细节把分享链接误判为失败。
+    if {best.kind, second.kind} == {"http", "local"}:
+        keeper, loser = (best, second) if best.kind == "http" else (second, best)
+        return keeper, loser, "keep", diff
     return best, second, "tie", diff
 
 
@@ -248,6 +260,7 @@ def _file_dict(f: Optional[_File]) -> Optional[Dict[str, Any]]:
         "score": round(f.score, 2),
         "why": f.why,
         "slot": f.slot,
+        "strmKind": f.kind,
         "fileExtension": f.info.get("fileExtension"),
         "resolution": f.info.get("resolution"),
         "videoCodec": f.info.get("videoCodec"),

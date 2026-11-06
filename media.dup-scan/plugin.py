@@ -36,7 +36,7 @@ from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, t
 from core.workscan import parse_work_dir, scan_work, summarize
 
 MANIFEST_ID = "media.dup-scan"
-PLUGIN_VERSION = "1.3.4"
+PLUGIN_VERSION = "1.3.5"
 
 KV_CONFIG = "config"
 KV_CURRENT_SCAN = "currentScan"
@@ -200,6 +200,7 @@ def _compact_file(item: dict[str, Any]) -> dict[str, Any]:
         "score": item.get("score", 0),
         "why": item.get("why", ""),
         "slot": item.get("slot", ""),
+        "strmKind": item.get("strmKind", ""),
         "ref": item.get("ref", ""),
         "version": item.get("version", ""),
         "rootId": item.get("rootId", ""),
@@ -451,7 +452,8 @@ def _score_entries(
         sn = _attach_snake(info)
         sc, _why = _scoring.score(sn, scorer_rules)
         slot = _slot_of(info, slots)
-        out.append({"entry": e, "info": info, "score": sc, "slot": slot})
+        out.append({"entry": e, "info": info, "score": sc, "slot": slot,
+                    "kind": e.get("strmKind", "")})
     return out
 
 
@@ -482,6 +484,7 @@ def _evaluate_prepared(
         if read_content:
             for entry in entries:
                 text = _read_first_line(ctx, entry)
+                entry["strmKind"] = _classify_strm_url(text)
                 entry["realExt"] = extract_real_ext(text) if text else ""
                 # 槽位修正后需重解析 fileExtension，缓存失效则重 parse 一次
                 if entry.get("_info") is not None and entry["realExt"]:
@@ -512,7 +515,7 @@ def _evaluate_prepared(
             scored = _score_entries(items, scorer_rules)
             # 组装 _File 兼容 _decide（其入参为 _File 对象列表，取 score/slot）
             from core.workscan import _File  # noqa: PLC0415
-            files = [_File(it["entry"].get("rel",""), it["entry"].get("name",""), it["info"], it["score"], [], it["slot"]) for it in scored]
+            files = [_File(it["entry"].get("rel",""), it["entry"].get("name",""), it["info"], it["score"], [], it["slot"], it.get("kind","")) for it in scored]
             keep, drop, verdict, diff = _decide(files, min_diff)
             if verdict == "none":
                 continue
@@ -866,23 +869,32 @@ class Plugin(PluginBase):
             ),
             title="操作控制台",
         )
+        def _ccol(label, field):
+            # 表格内居中：单元格用 Stack(align="center") 包 Text（Table 列无 align 属性，
+            # Stack 的 align 是注册表 documented 的居中方式）。
+            return {"label": label, "field": field,
+                    "cells": [ui.Stack(ui.Text(text=ui.ref("row." + field)), align="center")]}
+        _dup_columns = [
+            _ccol("作品", "label"), _ccol("槽位", "slot"), _ccol("判定", "verdict"),
+            _ccol("保留", "keep"), _ccol("保留分", "keepScore"),
+            _ccol("删除", "drop"), _ccol("删除分", "dropScore"), _ccol("分差", "diff"),
+        ]
         dup_table = ui.Section(
+            ui.Text(text=ui.expr("concat", "🔗 分享链接失败者：", ui.expr("coalesce", ui.ref("query.summary.data.httpTotal"), 0), " 组（同分默认本地路径为失败者）"), size="sm"),
             ui.Table(
-                source=ui.ref("query.summary.data.items"),
-                columns=[
-                    {"label": "作品", "field": "label", "cells": [ui.Text(text=ui.ref("row.label"))]},
-                    {"label": "槽位", "field": "slot", "cells": [ui.Text(text=ui.ref("row.slot"))]},
-                    {"label": "判定", "field": "verdict", "cells": [ui.Text(text=ui.ref("row.verdict"))]},
-                    {"label": "保留", "field": "keep", "cells": [ui.Text(text=ui.ref("row.keep"))]},
-                    {"label": "保留分", "field": "keepScore", "cells": [ui.Text(text=ui.ref("row.keepScore"))]},
-                    {"label": "删除", "field": "drop", "cells": [ui.Text(text=ui.ref("row.drop"))]},
-                    {"label": "删除分", "field": "dropScore", "cells": [ui.Text(text=ui.ref("row.dropScore"))]},
-                    {"label": "分差", "field": "diff", "cells": [ui.Text(text=ui.ref("row.diff"))]},
-                ],
+                source=ui.ref("query.summary.data.httpItems"),
+                columns=_dup_columns,
                 rowKey="key",
                 selectionBind="state.selected_wash_ids",
             ),
-            title="重复结果明细",
+            ui.Text(text=ui.expr("concat", "💾 本地路径失败者：", ui.expr("coalesce", ui.ref("query.summary.data.localTotal"), 0), " 组"), size="sm"),
+            ui.Table(
+                source=ui.ref("query.summary.data.localItems"),
+                columns=_dup_columns,
+                rowKey="key",
+                selectionBind="state.selected_wash_ids",
+            ),
+            title="重复结果明细（按失败者分类，两组默认同时显示）",
         )
         dup_tab = ui.Tab(dup_settings, dup_overview, dup_actions, dup_table, id="tab-dup", label="🎬 STRM 重复查重")
 
@@ -1011,7 +1023,13 @@ class Plugin(PluginBase):
                 return 0
             _keep_names = _keep_drop_names(group.get("keep"), _files, "keep")
             _drop_names = _keep_drop_names(group.get("drop"), _files, "drop")
-            rows.append({
+            def _kind_of(names):
+                for _f in _files:
+                    if isinstance(_f, dict) and (_f.get("name") in names or _f.get("rel") in names):
+                        return _f.get("strmKind") or ""
+                return ""
+            drop_kind = _kind_of(set(_drop_names))
+            _row = {
                 "key": f"{idx}",
                 "label": group.get("label") or group.get("workDir", ""),
                 "slot": group.get("slot", ""),
@@ -1022,9 +1040,11 @@ class Plugin(PluginBase):
                 "dropScore": _score_of(set(_drop_names)),
                 "diff": group.get("diff", 0),
                 "minDiff": group.get("minDiff", 0),
+                "dropKind": drop_kind,
                 "name": "",
                 "url": "",
-            })
+            }
+            rows.append(_row)
         tool_items = _storage_list(ctx, f"scans/{run_id}/tool/", LIST_LIMIT)
         tool_rows = []
         for idx, item in enumerate(tool_items[:100]):
@@ -1052,7 +1072,11 @@ class Plugin(PluginBase):
         tool_count = scan_summary.get("nonHttpCount", len(tool_rows)) if isinstance(scan_summary, dict) else len(tool_rows)
         tool_summary = ("非 HTTP 异常：%s 个（%s）" % (tool_count, "、".join(sorted({r["reason"] for r in tool_rows})) or "未扫描")) if tool_rows else "非 HTTP 异常：0（未扫描或无异常）"
         overview_line = "共 %d 组重复判定（%d 条明细）" % (total, len(rows)) if rows else "本次未发现重复组"
-        return {"items": rows, "toolItems": tool_rows, "total": total,
+        http_items = [r for r in rows if r.get("dropKind") == "http"]
+        local_items = [r for r in rows if r.get("dropKind") != "http"]
+        return {"items": rows, "httpItems": http_items, "localItems": local_items,
+                "httpTotal": len(http_items), "localTotal": len(local_items),
+                "toolItems": tool_rows, "total": total,
                 "toolTotal": tool_count, "overviewLine": overview_line, "toolSummary": tool_summary, "runId": run_id}
 
     # -- Actions ---------------------------------------------------------
