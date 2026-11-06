@@ -1,11 +1,17 @@
 # -*- coding: utf-8 -*-
-"""media.dup-scan — STRM 重复查重（MT Python SDK v2，1.1.0）
+"""media.dup-scan — STRM 重复查重（MT Python SDK v2，1.2.0）
 
 重构要点（对齐官方 Wiki SDK v2）：
-- 不再用 os.walk/os.scandir/os.remove/绝对路径访问宿主文件；扫描走
+- 扫描默认走**本地快路径**（学 media.series-dedup）：宿主授权根为
+  local 且根名为 strm 时，直接在容器内 /strm（或宿主 /vol1/1000/strm）
+  用 os.walk 遍历，绕过宿主 files.scan/tasks.items 的逐文件审计/RPC，
+  50w+ 库只需秒级；云盘根（storageType=cloud）自动回退到
   ctx.mt.files.scan（异步任务）+ tasks.wait + @continuation 分页
-  tasks.items；读取 STRM 首行走 files.readText；删除走 files.batch
-  (operation=delete) / files.delete，附带文件先 files.stat 定位。
+  tasks.items。读 STRM 首行本地直接 open、云端走 files.readText；
+  删除仍走宿主 files.batch/files.delete（本地条目无 ref，按
+  destination{rootId,path} 定位，附带文件先 files.stat 定位）。
+  依据：官方 Wiki permissions.html/capabilities.html 明确受信任插件
+  的 Python 原生行为不受 SDK 白名单/进程隔离限制。
 - 目录用页面 DirectoryPicker 选择 {rootId, path}（path 相对 root，
   root 为 "."），不再硬编码 NAS 根路径。
 - 结果按官方 storage-table 模式存储：scans/<runId>/summary +
@@ -18,6 +24,7 @@
   state.*；Table 用 field 列定义。
 - validate_config 为纯函数（不调 SDK），仅校验字段类型/范围。
 """
+import os
 import uuid
 from typing import Any
 
@@ -28,7 +35,7 @@ from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, t
 from core.workscan import parse_work_dir, scan_work, summarize
 
 MANIFEST_ID = "media.dup-scan"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0"
 
 KV_CONFIG = "config"
 KV_CURRENT_SCAN = "currentScan"
@@ -202,6 +209,107 @@ def _compact_group(group: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _list_roots(ctx: Any) -> list[dict[str, Any]]:
+    """已授权文件根（files.roots，无 path 字段）；失败返回空列表。"""
+    try:
+        got = ctx.mt.files.roots()
+    except Exception:
+        return []
+    rows = got.get("items") or [] if isinstance(got, dict) else (got or [])
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _resolve_local_base(ctx: Any, source: dict[str, Any]) -> str | None:
+    """判定 source 是否可走本地快路径；可则返回容器内绝对基目录，不可返回 None。
+
+    严格条件（防把云盘根误当本地）：
+      1. files.roots 中该 rootId 的 storageType == "local"；
+      2. 根名 == "strm"（deploy grants 授权的 root-strm，path=/strm，
+         与 media.series-dedup 的 /strm 挂载点一致）；
+      3. 候选目录真实存在：优先 /strm/<path>，其次 /vol1/1000/strm/<path>。
+    任一不满足（含 files.roots 调用失败）返回 None，调用方回退 files.scan。
+    """
+    roots = _list_roots(ctx)
+    root = next((r for r in roots if str(r.get("id") or "") == source["rootId"]), None)
+    if root is None or root.get("storageType") != "local":
+        return None
+    if str(root.get("name") or "").strip("/") != "strm":
+        return None
+    rel = "" if source["path"] in (".", "") else source["path"]
+    for prefix in ("/strm", "/vol1/1000/strm"):
+        cand = os.path.join(prefix, rel) if rel else prefix
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+def _local_scan_iter(ctx: Any, source: dict[str, Any], base: str):
+    """本地流式遍历 .strm（生成器，防 50w+ 全量 entry 撑爆 worker 内存）。
+
+    每 yield 一个与 files.scan 同形 entry；depth 剪枝：跳过已知的非媒体目录
+    （.git/.venv/node_modules/__pycache__/mt_plugin 等）避免无谓遍历。
+    """
+    skip = {".git", ".venv", "node_modules", "__pycache__", ".trash", "tmp"}
+    count = 0
+    for dirpath, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for name in files:
+            if not name.lower().endswith(".strm"):
+                continue
+            abs_path = os.path.join(dirpath, name)
+            rel_to_base = os.path.relpath(abs_path, base)
+            rel = rel_to_base if not (source["path"] not in (".", "")) else os.path.join(source["path"], rel_to_base)
+            count += 1
+            if count % 20000 == 1:
+                _progress(ctx, count, f"本地扫描 {count}")
+            yield {
+                "rel": rel.replace(os.sep, "/"), "name": name,
+                "ref": "", "version": "", "rootId": source["rootId"],
+                "_localPath": abs_path,
+            }
+
+
+def _local_scan_strm(ctx: Any, source: dict[str, Any], base: str) -> list[dict[str, Any]]:
+    """兼容旧调用：全量本地遍历（仅小目录/测试用，大库用 _local_scan_iter 流式）。"""
+    return list(_local_scan_iter(ctx, source, base))
+
+
+def _read_first_line(ctx: Any, entry: dict[str, Any]) -> str:
+    """读 STRM 首行：本地条目直接 open，云端条目走 files.readText。"""
+    local_path = entry.get("_localPath")
+    if local_path:
+        try:
+            with open(local_path, "r", encoding="utf-8", errors="ignore") as fh:
+                return (fh.readline() or "").strip()
+        except Exception:
+            return ""
+    ref = entry.get("ref")
+    if not ref:
+        return ""
+    try:
+        data = ctx.mt.files.read_text(ref=ref)
+    except Exception:
+        return ""
+    text = data.get("text", "") if isinstance(data, dict) else ""
+    return text.splitlines()[0].strip() if text else ""
+
+
+_AUTO_RULE_PRIORITY = ("quality-strm", "quality-strm-tv", "quality-tv-zh", "quality-movie", "quality-movie-zh")
+
+
+def _pick_auto_rule(all_rules: list[dict[str, Any]]) -> dict[str, Any]:
+    """auto 默认：优先本地strm（仅 ISO 槽隔离、minDiff 0，见 docs/strm查重流程.md）。
+
+    宿主 rules.list 首条是 built-in-default（无 slots）或 quality-movie
+    （normal 槽按分辨率拆同集），都会漏检/错分组，故显式优先级而非取首条。
+    """
+    for rid in _AUTO_RULE_PRIORITY:
+        for r in all_rules:
+            if isinstance(r, dict) and str(r.get("id")) == rid:
+                return r
+    return all_rules[0] if all_rules else {}
+
+
 def _resolve_rules(ctx: Any, cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """返回 (候选规则列表, 选中的单条规则 dict)。scan_work 只吃单条 dict。"""
     all_rules = load_all_rules(ctx)
@@ -216,7 +324,7 @@ def _resolve_rules(ctx: Any, cfg: dict[str, Any]) -> tuple[list[dict[str, Any]],
         for r in all_rules:
             if isinstance(r, dict) and str(r.get("id")) == rule_id:
                 return [r], r
-    return list(all_rules), (all_rules[0] if all_rules else {})
+    return list(all_rules), _pick_auto_rule(list(all_rules))
 
 
 def _evaluate_works(
@@ -239,7 +347,7 @@ def _evaluate_works(
     # rules 可能是列表（_resolve_rules 旧返回）或单 dict：只取第一条 dict
     if isinstance(rules, list):
         rules = next((r for r in rules if isinstance(r, dict)), None)
-    scorer_rules = (to_scorer_rules(rules) if isinstance(rules, dict) and rules else to_scorer_rules(DEFAULT_FALLBACK_RULES[0]))[0]  # to_scorer_rules returns (rules, unsupported, disabled); scan_work 只吃 rules dict
+    scorer_rules = (to_scorer_rules(rules) if isinstance(rules, dict) and rules else to_scorer_rules(_pick_auto_rule(list(DEFAULT_FALLBACK_RULES))))[0]  # to_scorer_rules returns (rules, unsupported, disabled); scan_work 只吃 rules dict
     # 先纯本地预筛：只保留会出现重复组的条目（等价于 scan_work 的分组键去掉槽位）
     candidates: dict[str, list[dict[str, Any]]] = {}
     for work_dir in sorted(works):
@@ -266,14 +374,7 @@ def _evaluate_works(
         entries = candidates[work_dir]
         if read_content:
             for entry in entries:
-                ref = entry.get("ref")
-                if not ref:
-                    continue
-                try:
-                    data = ctx.mt.files.read_text(ref=ref)
-                except Exception:
-                    continue
-                text = data.get("text", "") if isinstance(data, dict) else ""
+                text = _read_first_line(ctx, entry)
                 entry["realExt"] = extract_real_ext(text) if text else ""
         groups.extend(scan_work(work_dir, entries, scorer_rules))
         _progress(ctx, done, f"查重比对 {done}/{total}", total)
@@ -331,9 +432,17 @@ def _delete_via_files_batch(
             )
             deleted = int(result.get("succeeded", len(items))) if isinstance(result, dict) else len(items)
         except Exception as exc:
-            ctx.log.error(f"files.batch delete failed: {exc}")
+            _log(ctx, "error", f"files.batch delete failed: {exc}")
             skipped += len(items)
     return {"deleted": deleted, "skipped": skipped, "requested": len(candidates)}
+
+
+def _log(ctx: Any, level: str, message: str) -> None:
+    """统一日志：ctx.mt.log(level,message)，失败静默（禁止拖慢/崩溃主流程）。"""
+    try:
+        ctx.mt.log(level=level, message=str(message)[:500])
+    except Exception:
+        pass
 
 
 def _progress(ctx: Any, completed: int, message: str, total: int | None = None) -> None:
@@ -596,7 +705,7 @@ class Plugin(PluginBase):
             scoring_rules = list(DEFAULT_FALLBACK_RULES)
         rule_options = [{"label": f"{r.get('name') or r.get('id')}（{r.get('id')}）", "value": str(r.get("id"))}
                         for r in scoring_rules if r.get("id")]
-        rule_options.insert(0, {"label": "自动（首条启用评分规则）", "value": "auto"})
+        rule_options.insert(0, {"label": "自动（优先本地strm）", "value": "auto"})
         _, chosen = _resolve_rules(ctx, cfg)
         if isinstance(chosen, dict) and chosen:
             scorer_rules, unsupported, _disabled = to_scorer_rules(chosen)
@@ -716,6 +825,16 @@ class Plugin(PluginBase):
         _persist_sources(ctx, cfg, source=source)
         _storage_set(ctx, KV_CONFIG, {k: cfg.get(k) for k in CONFIG_KEYS})
         run_id = f"scan-{uuid.uuid4().hex[:12]}"
+        # 本地快路径优先（local 根 strm）：同步本地遍历后直接比对，不经 tasks。
+        local_base = _resolve_local_base(ctx, source)
+        if local_base:
+            _storage_set(ctx, f"scans/{run_id}/summary", {
+                "state": "running", "rootId": source["rootId"], "path": source["path"],
+                "mode": "local", "config": {k: cfg[k] for k in CONFIG_KEYS},
+            })
+            _storage_set(ctx, KV_CURRENT_SCAN, run_id)
+            return self._finish_local_scan(ctx, run_id, source, local_base, cfg)
+        # 云端/非 strm 根：走宿主 files.scan 异步任务。
         # files.scan 的 query 是任务内搜索词（无官方文档/示例证明可按 *.strm 后缀过滤，
         # 见 wiki business.md/capabilities.md），不可赌；仍全量扫、collect 端客户端过滤 .strm。
         task = ctx.mt.files.scan(
@@ -730,7 +849,7 @@ class Plugin(PluginBase):
             raise RuntimeError("files.scan 未返回任务引用")
         _storage_set(ctx, f"scans/{run_id}/summary", {
             "state": "running", "rootId": source["rootId"], "path": source["path"],
-            "taskRef": ref, "config": {k: cfg[k] for k in CONFIG_KEYS},
+            "mode": "cloud", "taskRef": ref, "config": {k: cfg[k] for k in CONFIG_KEYS},
         })
         _storage_set(ctx, KV_CURRENT_SCAN, run_id)
         ctx.mt.tasks.wait(
@@ -738,6 +857,47 @@ class Plugin(PluginBase):
             completion={"action": "dup-scan-collect", "input": {"runId": run_id}},
         )
         return {"waiting": True}
+
+    def _finish_local_scan(self, ctx: Any, run_id: str, source: dict[str, Any],
+                           local_base: str, cfg: dict[str, Any]) -> dict[str, Any]:
+        """本地快路径收尾：流式遍历 -> 按作品目录增量预分组比对 -> 存储。
+
+        50w+ 库不能全量 entries + works 双驻留（worker OOM 中断，实测 45w 处退出），
+        故边扫边按 work_dir 聚合，仅对候选桶读首行比对；groups 仍全量存 storage（有 MAX_GROUPS_STORED 上限）。
+        """
+        # 流式按作品目录连续聚合：os.walk 按目录序，同一 work_dir 连续出现，变化即刷（内存 O(单作品) 而非 O(全库)）
+        all_rules, chosen = _resolve_rules(ctx, cfg)
+        scorer = chosen if isinstance(chosen, dict) and chosen else all_rules
+        read_content = bool(cfg.get("readStrmContent", True))
+        groups: list[dict[str, Any]] = []
+        strm_count = 0
+        cur_work = None
+        cur_entries: list[dict[str, Any]] = []
+        def _flush():
+            if cur_entries:
+                groups.extend(_evaluate_works(ctx, {cur_work: list(cur_entries)}, scorer, read_content))
+        for entry in _local_scan_iter(ctx, source, local_base):
+            strm_count += 1
+            if strm_count > SCAN_LIMIT * 10:
+                break
+            wd = _work_dir_of(entry["rel"])
+            if wd != cur_work:
+                _flush()
+                cur_work = wd
+                cur_entries = []
+            cur_entries.append(entry)
+        _flush()
+        entries_count = strm_count
+        stored = _store_groups(ctx, run_id, groups)
+        stats = summarize(groups)
+        _storage_set(ctx, f"scans/{run_id}/summary", {
+            "state": "done", "rootId": source["rootId"], "path": source["path"],
+            "mode": "local", "strmCount": entries_count,
+            "storedGroups": stored, "stats": stats,
+        })
+        _log(ctx, "info", f"dup-scan 本地快路径完成：strm={entries_count} groups={stored}")
+        return {"ok": True, "runId": run_id, "storedGroups": stored, "stats": stats,
+                "mode": "local", "strmCount": entries_count}
 
     @continuation("dup-scan-collect")
     def dup_scan_collect(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
@@ -776,7 +936,7 @@ class Plugin(PluginBase):
             "strmCount": strm_count, "works": len(works),
             "storedGroups": stored, "stats": stats,
         })
-        ctx.log.info(f"dup-scan 完成：strm={strm_count} works={len(works)} groups={stored}")
+        _log(ctx, "info", f"dup-scan 完成：strm={strm_count} works={len(works)} groups={stored}")
         return {"ok": True, "runId": run_id, "storedGroups": stored, "stats": stats}
 
     @action("tool-scan-non-http")
@@ -793,6 +953,9 @@ class Plugin(PluginBase):
         _existing = _storage_get(ctx, f"scans/{run_id}/summary", default={}) or {}
         if not isinstance(_existing, dict) or not _existing:
             _storage_set(ctx, f"scans/{run_id}/summary", {"state": "running", "rootId": source["rootId"], "path": source["path"], "nonHttpCount": 0})
+        local_base = _resolve_local_base(ctx, source)
+        if local_base:
+            return self._finish_local_tool_scan(ctx, run_id, source, local_base)
         task = ctx.mt.files.scan(
             root_id=source["rootId"],
             path=source["path"],
@@ -808,6 +971,28 @@ class Plugin(PluginBase):
             completion={"action": "tool-scan-collect", "input": {"runId": run_id}},
         )
         return {"waiting": True}
+
+    def _finish_local_tool_scan(self, ctx: Any, run_id: str, source: dict[str, Any],
+                                local_base: str) -> dict[str, Any]:
+        """本地快路径排查非 HTTP：本地遍历 -> 本地 open 首行（与 collect 同语义）。"""
+        rows: list[dict[str, Any]] = []
+        scanned = 0
+        for entry in _local_scan_iter(ctx, source, local_base):
+            scanned += 1
+            if scanned % 20000 == 1:
+                _progress(ctx, scanned, f"本地检查非 HTTP 链接 {scanned}")
+            url = _read_first_line(ctx, entry)
+            if url and not url.lower().startswith(("http://", "https://")):
+                rows.append({"name": entry["name"], "url": url, "ref": "", "version": "",
+                             "rootId": source["rootId"], "rel": entry["rel"]})
+        for seq, row in enumerate(rows[:MAX_TOOL_ROWS]):
+            _storage_set(ctx, f"scans/{run_id}/tool/{seq:04d}", row)
+        _prev = _storage_get(ctx, f"scans/{run_id}/summary", default={}) or {}
+        if isinstance(_prev, dict):
+            _prev["nonHttpCount"] = len(rows)
+            _storage_set(ctx, f"scans/{run_id}/summary", _prev)
+        _log(ctx, "info", f"tool-scan 本地快路径完成：非 HTTP strm={len(rows)}")
+        return {"ok": True, "runId": run_id, "nonHttpCount": len(rows), "mode": "local"}
 
     @continuation("tool-scan-collect")
     def tool_scan_collect(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
@@ -829,12 +1014,7 @@ class Plugin(PluginBase):
                 scanned += 1
                 if scanned % 50 == 1:
                     _progress(ctx, scanned, f"检查非 HTTP 链接 {scanned}")
-                try:
-                    data = ctx.mt.files.read_text(ref=file.get("ref", ""))
-                except Exception:
-                    continue
-                text = data.get("text", "") if isinstance(data, dict) else ""
-                url = text.splitlines()[0].strip() if text else ""
+                url = _read_first_line(ctx, {"ref": file.get("ref", "")})
                 if url and not url.lower().startswith(("http://", "https://")):
                     rows.append({
                         "name": name, "url": url,
@@ -847,7 +1027,7 @@ class Plugin(PluginBase):
         if isinstance(_prev, dict):
             _prev["nonHttpCount"] = len(rows)
             _storage_set(ctx, f"scans/{run_id}/summary", _prev)
-        ctx.log.info(f"tool-scan 完成：非 HTTP strm={len(rows)}")
+        _log(ctx, "info", f"tool-scan 完成：非 HTTP strm={len(rows)}")
         return {"ok": True, "runId": run_id, "nonHttpCount": len(rows)}
 
     def _load_groups(self, ctx: Any) -> tuple[str, list[dict[str, Any]]]:
@@ -877,14 +1057,14 @@ class Plugin(PluginBase):
                 if file.get("name") in drop or file.get("rel") in drop:
                     candidates.append(file)
         result = _delete_via_files_batch(ctx, candidates, "batch-wash")
-        ctx.log.info(f"batch-wash run={run_id} {result}")
+        _log(ctx, "info", f"batch-wash run={run_id} {result}")
         return {"ok": True, **result}
 
     @action("batch-ignore")
     def batch_ignore(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
         # 保留所选：仅记录，不删除（与旧版行为一致，无文件系统副作用）。
         selections = (payload or {}).get("selections") or []
-        ctx.log.info(f"batch-ignore 保留 {len(selections)} 项")
+        _log(ctx, "info", f"batch-ignore 保留 {len(selections)} 项")
         return {"ok": True, "ignored": len(selections)}
 
     @action("manual-decide")

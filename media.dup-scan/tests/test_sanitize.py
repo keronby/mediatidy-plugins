@@ -22,9 +22,20 @@ import plugin as plug
 class TestSanitize(unittest.TestCase):
     def test_no_forbidden_local_calls(self):
         src = (ROOT / "plugin.py").read_text()
-        for bad in ("os.walk(", "os.scandir(", "os.remove(", "os.path.isdir("):
+        # 本地快路径（1.2.0）允许 os.walk/os.path.isdir/open 受信任原生行为；
+        # 仍禁止 os.remove/os.scandir（删除走宿主 files.batch）。
+        for bad in ("os.scandir(", "os.remove("):
             self.assertNotIn(bad, src, bad)
         self.assertNotIn("dup_scan_user_config.json", src)
+    def test_local_fast_path_helpers(self):
+        self.assertTrue(callable(plug._resolve_local_base))
+        self.assertTrue(callable(plug._local_scan_strm))
+        self.assertTrue(callable(plug._read_first_line))
+    def test_auto_rule_priority(self):
+        self.assertEqual(plug._pick_auto_rule([{"id":"built-in-default"},{"id":"quality-movie"}])["id"], "quality-movie")
+        self.assertEqual(plug._pick_auto_rule(list(plug.DEFAULT_FALLBACK_RULES))["id"], "quality-strm")
+        self.assertEqual(plug._pick_auto_rule([{"id":"quality-strm"},{"id":"quality-movie"}])["id"], "quality-strm")
+        self.assertEqual(plug._pick_auto_rule([{"id":"x"}])["id"], "x")
     def test_clean_source(self):
         self.assertEqual(plug._clean_source({"rootId":"r1","path":"a/b"}), {"rootId":"r1","path":"a/b"})
         self.assertIsNone(plug._clean_source({"rootId":"r1","path":"/abs"}))

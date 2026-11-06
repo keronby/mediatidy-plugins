@@ -47,7 +47,7 @@ def main(zip_path):
     grants = {
         "autoProfileIds": [], "profileRevisions": {}, "strmRevisions": {},
         "capabilities": perm,
-        "roots": [{"read": True, "write": False, "delete": False,
+        "roots": [{"read": True, "write": True, "delete": True,
                    "id": "root-strm", "name": "strm", "path": ROOT, "storageType": "local"}],
         "profileIds": pids, "strmProfileIds": pids, "channelIds": [], "http": None,
     }
@@ -60,4 +60,4 @@ def main(zip_path):
     print("rules:", json.dumps(q, ensure_ascii=False)[:300])
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "dist", "media.dup-scan-1.0.0.zip"))
+    main(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "dist", "media.dup-scan-1.2.0.zip"))

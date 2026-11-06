@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "plugins": [
+    { "id": "media.dup-scan", "path": "media.dup-scan" },
+    { "id": "media.series-dedup", "path": "media.series-dedup" },
+    { "id": "media.sweep", "path": "media.sweep" }
+  ]
+}
