@@ -160,7 +160,7 @@ DEFAULT_FALLBACK_RULES = [
             ],
         },
         "scoring": {
-            "resolution": {"enabled": True, "weight": 20, "priority": ["2160p", "1080p", "1080i", "720p"]},
+            "resolution": {"enabled": True, "weight": 20, "priority": ["4320p", "2160p", "1080p", "1080i", "720p", "576p", "480p", "360p"]},
             "video_codec": {"enabled": True, "weight": 10, "priority": ["H.265", "H.264", "AV1", "VP9"]},
             "hdr": {"enabled": True, "weight": 40, "priority": ["Dolby Vision P7", "Dolby Vision", "HDR10+", "HDR10", "HLG", "SDR"]},
             "bitrate": {"enabled": True, "weight": 25},
@@ -178,7 +178,7 @@ DEFAULT_FALLBACK_RULES = [
             ],
         },
         "scoring": {
-            "resolution": {"enabled": True, "weight": 20, "priority": ["2160p", "1080p", "1080i", "720p"]},
+            "resolution": {"enabled": True, "weight": 20, "priority": ["4320p", "2160p", "1080p", "1080i", "720p", "576p", "480p", "360p"]},
             "video_codec": {"enabled": True, "weight": 10, "priority": ["H.265", "H.264", "AV1", "VP9"]},
             "hdr": {"enabled": True, "weight": 40, "priority": ["Dolby Vision P7", "Dolby Vision", "HDR10+", "HDR10", "HLG", "SDR"]},
             "bitrate": {"enabled": True, "weight": 25},
@@ -190,7 +190,7 @@ DEFAULT_FALLBACK_RULES = [
         "min_score_diff": 8,
         "version": {"enabled": True, "slots": []},
         "scoring": {
-            "resolution": {"enabled": True, "weight": 20, "priority": ["2160p", "1080p", "1080i", "720p"]},
+            "resolution": {"enabled": True, "weight": 20, "priority": ["4320p", "2160p", "1080p", "1080i", "720p", "576p", "480p", "360p"]},
             "video_codec": {"enabled": True, "weight": 10, "priority": ["H.265", "H.264", "AV1", "VP9"]},
             "hdr": {"enabled": True, "weight": 40, "priority": ["Dolby Vision P7", "Dolby Vision", "HDR10+", "HDR10", "HLG", "SDR"]},
             "bitrate": {"enabled": True, "weight": 25},
@@ -202,7 +202,7 @@ DEFAULT_FALLBACK_RULES = [
         "min_score_diff": 8,
         "version": {"enabled": True, "slots": []},
         "scoring": {
-            "resolution": {"enabled": True, "weight": 20, "priority": ["2160p", "1080p", "1080i", "720p"]},
+            "resolution": {"enabled": True, "weight": 20, "priority": ["4320p", "2160p", "1080p", "1080i", "720p", "576p", "480p", "360p"]},
             "video_codec": {"enabled": True, "weight": 10, "priority": ["H.265", "H.264", "AV1", "VP9"]},
             "hdr": {"enabled": True, "weight": 40, "priority": ["Dolby Vision P7", "Dolby Vision", "HDR10+", "HDR10", "HLG", "SDR"]},
             "bitrate": {"enabled": True, "weight": 25},
@@ -217,7 +217,7 @@ DEFAULT_FALLBACK_RULES = [
             "slots": [{"name": "ISO", "match": {"file_extension": ["iso"]}}],
         },
         "scoring": {
-            "resolution": {"enabled": True, "weight": 20, "priority": ["2160p", "1080p", "1080i", "720p"]},
+            "resolution": {"enabled": True, "weight": 20, "priority": ["4320p", "2160p", "1080p", "1080i", "720p", "576p", "480p", "360p"]},
             "video_codec": {"enabled": True, "weight": 10, "priority": ["H.265", "H.264", "AV1", "VP9"]},
             "hdr": {"enabled": True, "weight": 40, "priority": ["Dolby Vision P7", "Dolby Vision", "HDR10+", "HDR10", "HLG", "SDR"]},
             "bitrate": {"enabled": True, "weight": 25},

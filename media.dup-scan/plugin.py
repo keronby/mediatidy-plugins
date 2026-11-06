@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""media.dup-scan — STRM 重复查重（MT Python SDK v2，1.2.0）
+"""media.dup-scan — STRM 重复查重（MT Python SDK v2，1.3.0）
 
 重构要点（对齐官方 Wiki SDK v2）：
 - 扫描默认走**本地快路径**（学 media.series-dedup）：宿主授权根为
@@ -35,7 +35,7 @@ from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, t
 from core.workscan import parse_work_dir, scan_work, summarize
 
 MANIFEST_ID = "media.dup-scan"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 
 KV_CONFIG = "config"
 KV_CURRENT_SCAN = "currentScan"
@@ -54,6 +54,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "readStrmContent": True,
     "scanSource": None,   # {rootId, path}，上次选择的查重扫描目录
     "toolSource": None,   # {rootId, path}，上次选择的工具扫描目录
+    # 本地/网盘地址映射（series-dedup core/matcher.py:53-55 同款语义，无预设值，用户自填）
+    # 例：localDestDir=/strm/云盘影视  cloudDestDir=/小小玻珠/云盘影视
+    "localDestDir": "",
+    "cloudDestDir": "",
 }
 CONFIG_KEYS = tuple(DEFAULT_CONFIG.keys())
 
@@ -453,6 +457,171 @@ def _delete_via_files_batch(
     return {"deleted": deleted, "skipped": skipped, "requested": len(candidates)}
 
 
+
+def _classify_strm_url(text: str) -> str:
+    """按 STRM 首行内容分组：http(s) 开头为分享（网盘），其余为本地。"""
+    t = (text or "").strip()
+    return "http" if t.lower().startswith(("http://", "https://")) else "local"
+
+
+def _same_stem_media_candidates(local_path: str, exts=("mkv", "mp4", "ts", "m2ts", "avi", "iso", "bdmv", "rmvb", "wmv", "flv", "mov")):
+    """本地删除：去除 .strm 后缀，同名媒体文件候选（绝对路径列表）。"""
+    if not local_path.lower().endswith(".strm"):
+        return []
+    stem = local_path[:-5]
+    return [stem + "." + e for e in exts]
+
+
+def _map_local_to_cloud(local_strm_abs: str, local_dest: str, cloud_dest: str) -> str | None:
+    """series-dedup 地址映射（core/submitter.py:to_mt_path 本地分支 + matcher local/cloud）：
+    把 /strm/云盘影视/... 的本地绝对路径换成网盘根下的同相对路径。
+    local_dest/cloud_dest 形如 /strm/云盘影视、/小小玻珠/云盘影视（无预设，用户自填）。
+    容器内 /strm 与宿主 /vol1/1000/strm 视为同一前缀。返回映射后的 MT 路径（以 / 开头），
+    无法映射返回 None。"""
+    if not local_dest or not cloud_dest or not local_strm_abs:
+        return None
+    # 归一本地前缀：/strm 与 /vol1/1000/strm 等价
+    cand = local_strm_abs
+    for pre in ("/vol1/1000/strm", "/strm"):
+        if cand.startswith(pre):
+            cand = "/strm" + cand[len(pre):]
+            break
+    ld = local_dest.rstrip("/")
+    if ld.startswith("/vol1/1000/strm"):
+        ld = "/strm" + ld[len("/vol1/1000/strm"):]
+    if not cand.startswith(ld):
+        return None
+    sub = cand[len(ld):]
+    if not sub.startswith("/"):
+        sub = "/" + sub
+    return cloud_dest.rstrip("/") + sub
+
+
+def _delete_by_content(
+    ctx: Any, candidates: list[dict[str, Any]], purpose: str,
+    local_dest: str = "", cloud_dest: str = "",
+) -> dict[str, int]:
+    """按 STRM 内容分组删除（用户 m01409 需求 2）：
+      - http(s) 分享：删 .strm 本体 + 同名 .nfo + 同名 -mediainfo.json；
+      - 本地：用地址映射把网盘路径换成本地同名媒体文件后删除该媒体文件
+        （series-dedup matcher/submitter 映射语义），删不到媒体文件时回退删 .strm 本体。
+    本地条目（_localPath）直接 os.remove；云端条目走 files.batch destination。
+    """
+    deleted = 0
+    skipped = 0
+    # 先按分类收集 files.batch items（云端）与本地 os.remove 列表
+    batch_items: list[dict[str, Any]] = []
+    local_removes: list[str] = []
+    for cand in candidates[:DELETE_BATCH_LIMIT]:
+        local_path = cand.get("_localPath") or ""
+        # 读内容分类
+        text = ""
+        if local_path:
+            try:
+                with open(local_path, "r", encoding="utf-8", errors="ignore") as fh:
+                    text = (fh.readline() or "").strip()
+            except Exception:
+                text = ""
+        else:
+            text = _read_first_line(ctx, cand)
+        kind = _classify_strm_url(text)
+        root_id = cand.get("rootId") or ""
+        rel = cand.get("rel") or ""
+        ref = cand.get("ref") or ""
+        if kind == "http":
+            # 删 strm + .nfo + -mediainfo.json（同 stem 去 .strm 后缀再加）
+            targets = [rel] if rel else []
+            if rel:
+                stem = rel[:-5] if rel.lower().endswith(".strm") else rel
+                targets += [stem + ".nfo", stem + "-mediainfo.json"]
+            for t in targets:
+                if local_path and t == rel:
+                    local_removes.append(local_path)
+                elif local_path:
+                    # 本地附带文件：与 strm 同目录同 stem
+                    stem_lp = local_path[:-5] if local_path.lower().endswith(".strm") else local_path
+                    suffix = t[len(rel):] if t.startswith(rel) else (".nfo" if t.endswith(".nfo") else "-mediainfo.json")
+                    # t 形如 stem_rel+.nfo / stem_rel+-mediainfo.json，suffix 即 .nfo / -mediainfo.json
+                    if t.endswith(".nfo"):
+                        suffix = ".nfo"
+                    elif t.endswith("-mediainfo.json"):
+                        suffix = "-mediainfo.json"
+                    local_removes.append(stem_lp + suffix)
+                elif ref and t == rel:
+                    batch_items.append({"operation": "delete", "fileRef": ref})
+                elif root_id and t:
+                    batch_items.append({"operation": "delete", "destination": {"rootId": root_id, "path": t}, "recursive": False})
+                else:
+                    skipped += 1
+        else:
+            # 本地：映射后删同名媒体文件；映射失败或媒体不存在回退删 strm 本体
+            mapped = None
+            media_abs = None
+            if local_path and local_dest and cloud_dest:
+                # local_path 形如 /vol1/1000/strm/云盘影视/.../x.strm -> 映射到 cloud 再反查本地媒体?
+                # 实际：本地 strm 内容是本地路径时，直接同目录找同名媒体；映射用于跨根定位
+                mapped = _map_local_to_cloud(local_path, local_dest, cloud_dest)
+            # 本地同名媒体：strm 去后缀 + 媒体后缀，同目录
+            cands = _same_stem_media_candidates(local_path) if local_path else []
+            found = next((c for c in cands if os.path.exists(c)), None)
+            if found:
+                local_removes.append(found)
+            elif mapped and local_dest:
+                # 映射到网盘路径后，网盘根下同名媒体：转回本地盘符尝试
+                # cloud_dest 形如 /小小玻珠/云盘影视，mapped 形如 /小小玻珠/云盘影视/.../x.strm
+                # 本地对应：/vol1/1000/strm + mapped 去 cloud 前缀? 仅当 cloud_dest 与 local_dest 同子路径时可换算
+                try:
+                    sub = mapped[len(cloud_dest.rstrip("/")):]
+                    alt_base = local_dest
+                    if alt_base.startswith("/strm"):
+                        alt_base = "/vol1/1000" + alt_base
+                    alt_strm = alt_base + sub
+                    for c in _same_stem_media_candidates(alt_strm):
+                        if os.path.exists(c):
+                            local_removes.append(c)
+                            found = c
+                            break
+                except Exception:
+                    pass
+                if not found:
+                    if local_path:
+                        local_removes.append(local_path)
+                    elif root_id and rel:
+                        batch_items.append({"operation": "delete", "destination": {"rootId": root_id, "path": rel}, "recursive": False})
+                    elif ref:
+                        batch_items.append({"operation": "delete", "fileRef": ref})
+                    else:
+                        skipped += 1
+            else:
+                if local_path:
+                    local_removes.append(local_path)
+                elif root_id and rel:
+                    batch_items.append({"operation": "delete", "destination": {"rootId": root_id, "path": rel}, "recursive": False})
+                elif ref:
+                    batch_items.append({"operation": "delete", "fileRef": ref})
+                else:
+                    skipped += 1
+    # 本地删除
+    for lp in local_removes:
+        try:
+            if os.path.exists(lp):
+                os.remove(lp)
+                deleted += 1
+            else:
+                skipped += 1
+        except Exception:
+            skipped += 1
+    # 云端批量删除
+    if batch_items:
+        try:
+            result = ctx.mt.files.batch(idempotency_key=_new_idempotency_key(ctx, purpose), items=batch_items[:DELETE_BATCH_LIMIT])
+            deleted += int(result.get("succeeded", len(batch_items))) if isinstance(result, dict) else len(batch_items)
+        except Exception as exc:
+            _log(ctx, "error", f"delete-by-content batch failed: {exc}")
+            skipped += len(batch_items)
+    return {"deleted": deleted, "skipped": skipped, "requested": len(candidates)}
+
+
 def _log(ctx: Any, level: str, message: str) -> None:
     """统一日志：ctx.mt.log(level,message)，失败静默（禁止拖慢/崩溃主流程）。"""
     try:
@@ -507,6 +676,10 @@ class Plugin(PluginBase):
             value = config.get(key)
             if value is not None and not isinstance(value, bool):
                 errors[key] = "必须是布尔值"
+        for key in ("localDestDir", "cloudDestDir"):
+            value = config.get(key)
+            if value is not None and not isinstance(value, str):
+                errors[key] = "必须是字符串"
         for key in ("scanSource", "toolSource"):
             value = config.get(key)
             if value is None:
@@ -566,6 +739,8 @@ class Plugin(PluginBase):
             ui.DirectoryPicker(label="扫描目录", bind="state.source"),
             ui.Select(label="查重规则", bind="state.ruleId", options=rule_options),
             ui.Checkbox(label="读取 STRM 首行做扩展名槽隔离", bind="state.readStrmContent"),
+            ui.Input(label="本地目录（映射，如 /strm/云盘影视）", type="text", bind="state.localDestDir"),
+            ui.Input(label="网盘目录（映射，如 /小小玻珠/云盘影视）", type="text", bind="state.cloudDestDir"),
             ui.Stack(
                 ui.Button(
                     label=ui.expr("if", is_scan_running, "⏳ 正在查重扫描中...", "开始查重"),
@@ -573,7 +748,7 @@ class Plugin(PluginBase):
                     disabled=is_scan_running,
                     loading=is_scan_running,
                     onClick=[
-                        {"type": "invoke", "actionId": "dup-scan", "input": {"source": ui.ref("state.source"), "ruleId": ui.ref("state.ruleId")}},
+                        {"type": "invoke", "actionId": "dup-scan", "input": {"source": ui.ref("state.source"), "ruleId": ui.ref("state.ruleId"), "localDestDir": ui.ref("state.localDestDir"), "cloudDestDir": ui.ref("state.cloudDestDir")}},
                         {"type": "query", "queryId": "summary"},
                         {"type": "query", "queryId": "rules"},
                     ],
@@ -621,8 +796,10 @@ class Plugin(PluginBase):
                     {"label": "槽位", "field": "slot", "cells": [ui.Text(text=ui.ref("row.slot"))]},
                     {"label": "判定", "field": "verdict", "cells": [ui.Text(text=ui.ref("row.verdict"))]},
                     {"label": "保留", "field": "keep", "cells": [ui.Text(text=ui.ref("row.keep"))]},
+                    {"label": "保留分", "field": "keepScore", "cells": [ui.Text(text=ui.ref("row.keepScore"))]},
                     {"label": "删除", "field": "drop", "cells": [ui.Text(text=ui.ref("row.drop"))]},
-                    {"label": "分差", "field": "minDiff", "cells": [ui.Text(text=ui.ref("row.minDiff"))]},
+                    {"label": "删除分", "field": "dropScore", "cells": [ui.Text(text=ui.ref("row.dropScore"))]},
+                    {"label": "分差", "field": "diff", "cells": [ui.Text(text=ui.ref("row.diff"))]},
                 ],
                 rowKey="key",
                 selectionBind="state.selected_wash_ids",
@@ -703,6 +880,8 @@ class Plugin(PluginBase):
                 "selected_tool_ids": [],
                 "ruleId": cfg.get("ruleId", "auto"),
                 "readStrmContent": cfg.get("readStrmContent", True),
+                "localDestDir": cfg.get("localDestDir", "") or "",
+                "cloudDestDir": cfg.get("cloudDestDir", "") or "",
                 "selected_wash_ids": [],
                 "busy": False,
             },
@@ -748,13 +927,24 @@ class Plugin(PluginBase):
             group = item.get("value", item) if isinstance(item, dict) else {}
             if not isinstance(group, dict):
                 continue
+            _files = group.get("files", []) if isinstance(group.get("files"), list) else []
+            def _score_of(names):
+                for _f in _files:
+                    if isinstance(_f, dict) and (_f.get("name") in names or _f.get("rel") in names):
+                        return _f.get("score", 0)
+                return 0
+            _keep_names = _keep_drop_names(group.get("keep"), _files, "keep")
+            _drop_names = _keep_drop_names(group.get("drop"), _files, "drop")
             rows.append({
                 "key": f"{idx}",
                 "label": group.get("label") or group.get("workDir", ""),
                 "slot": group.get("slot", ""),
                 "verdict": group.get("verdict", ""),
-                "keep": ", ".join(_keep_drop_names(group.get("keep"), group.get("files", []), "keep")),
-                "drop": ", ".join(_keep_drop_names(group.get("drop"), group.get("files", []), "drop")),
+                "keep": ", ".join(_keep_names),
+                "keepScore": _score_of(set(_keep_names)),
+                "drop": ", ".join(_drop_names),
+                "dropScore": _score_of(set(_drop_names)),
+                "diff": group.get("diff", 0),
                 "minDiff": group.get("minDiff", 0),
                 "name": "",
                 "url": "",
@@ -798,6 +988,9 @@ class Plugin(PluginBase):
             if key in payload:
                 cfg[key] = payload[key]
         cfg["readStrmContent"] = bool(cfg.get("readStrmContent", True))
+        for _mk in ("localDestDir", "cloudDestDir"):
+            if _mk in payload and isinstance(payload[_mk], str):
+                cfg[_mk] = payload[_mk].strip()
         if "scanSource" in payload:
             cfg["scanSource"] = _clean_source(payload.get("scanSource"))
         if "toolSource" in payload:
@@ -838,6 +1031,9 @@ class Plugin(PluginBase):
             cfg["ruleId"] = str(payload["ruleId"])
         if "readStrmContent" in payload:
             cfg["readStrmContent"] = bool(payload["readStrmContent"])
+        for _mk in ("localDestDir", "cloudDestDir"):
+            if _mk in payload and isinstance(payload[_mk], str) and payload[_mk].strip():
+                cfg[_mk] = payload[_mk].strip()
         _persist_sources(ctx, cfg, source=source)
         _storage_set(ctx, KV_CONFIG, {k: cfg.get(k) for k in CONFIG_KEYS})
         run_id = f"scan-{uuid.uuid4().hex[:12]}"
@@ -1061,6 +1257,17 @@ class Plugin(PluginBase):
         payload = payload or {}
         selections = payload.get("selections") or []
         run_id, groups = self._load_groups(ctx)
+        cfg = _cfg(ctx)
+        # 重建 _localPath：stored file 只有 rel/name，scan 时的 base 已记在 summary
+        scan_summary = _storage_get(ctx, f"scans/{run_id}/summary", default={}) if run_id else {}
+        root_id = (scan_summary.get("rootId") if isinstance(scan_summary, dict) else None) or ""
+        scan_path = (scan_summary.get("path") if isinstance(scan_summary, dict) else None) or "."
+        local_base = None
+        if root_id:
+            try:
+                local_base = _resolve_local_base(ctx, {"rootId": root_id, "path": scan_path})
+            except Exception:
+                local_base = None
         candidates: list[dict[str, Any]] = []
         selected = set(str(s) for s in selections) if selections else None
         for idx, group in enumerate(groups):
@@ -1071,8 +1278,14 @@ class Plugin(PluginBase):
                 continue
             for file in group.get("files", []):
                 if file.get("name") in drop or file.get("rel") in drop:
-                    candidates.append(file)
-        result = _delete_via_files_batch(ctx, candidates, "batch-wash")
+                    f = dict(file)
+                    if local_base and f.get("rel"):
+                        f["rootId"] = root_id
+                        f["_localPath"] = os.path.join(local_base, f["rel"])
+                    candidates.append(f)
+        result = _delete_by_content(ctx, candidates, "batch-wash",
+                                    local_dest=cfg.get("localDestDir", "") or "",
+                                    cloud_dest=cfg.get("cloudDestDir", "") or "")
         _log(ctx, "info", f"batch-wash run={run_id} {result}")
         return {"ok": True, **result}
 

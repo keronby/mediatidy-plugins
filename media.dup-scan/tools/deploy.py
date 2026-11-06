@@ -60,4 +60,4 @@ def main(zip_path):
     print("rules:", json.dumps(q, ensure_ascii=False)[:300])
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "dist", "media.dup-scan-1.2.0.zip"))
+    main(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "dist", "media.dup-scan-1.3.0.zip"))

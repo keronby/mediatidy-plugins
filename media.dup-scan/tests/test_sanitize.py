@@ -23,8 +23,10 @@ class TestSanitize(unittest.TestCase):
     def test_no_forbidden_local_calls(self):
         src = (ROOT / "plugin.py").read_text()
         # 本地快路径（1.2.0）允许 os.walk/os.path.isdir/open 受信任原生行为；
-        # 仍禁止 os.remove/os.scandir（删除走宿主 files.batch）。
-        for bad in ("os.scandir(", "os.remove("):
+        # 1.3.0 按内容删除允许 os.remove（本地同名媒体/附带文件，需在容器内
+        #  /vol1/1000/strm 真实存在才删，wiki permissions 受信任代码不限原生行为）；
+        # 仍禁止 os.scandir（遍历走 os.walk 生成器）。
+        for bad in ("os.scandir(",):
             self.assertNotIn(bad, src, bad)
         self.assertNotIn("dup_scan_user_config.json", src)
     def test_local_fast_path_helpers(self):
