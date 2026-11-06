@@ -36,7 +36,7 @@ from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, t
 from core.workscan import parse_work_dir, scan_work, summarize
 
 MANIFEST_ID = "media.dup-scan"
-PLUGIN_VERSION = "1.3.5"
+PLUGIN_VERSION = "1.3.6"
 
 KV_CONFIG = "config"
 KV_CURRENT_SCAN = "currentScan"
@@ -1008,7 +1008,7 @@ class Plugin(PluginBase):
     def summary(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
         run_id = _storage_get(ctx, KV_CURRENT_SCAN, default=None)
         if not run_id:
-            return {"items": [], "toolItems": [], "total": 0, "toolTotal": 0, "overviewLine": "尚未扫描", "toolSummary": "非 HTTP 异常：0（未扫描或无异常）", "message": "未执行扫描"}
+            return {"items": [], "httpItems": [], "localItems": [], "httpTotal": 0, "localTotal": 0, "toolItems": [], "total": 0, "toolTotal": 0, "overviewLine": "尚未扫描", "toolSummary": "非 HTTP 异常：0（未扫描或无异常）", "message": "未执行扫描"}
         items = _storage_list(ctx, f"scans/{run_id}/groups/", LIST_LIMIT)
         rows = []
         for idx, item in enumerate(items[:100]):
