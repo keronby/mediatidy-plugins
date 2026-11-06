@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""media.dup-scan — STRM 重复查重（MT Python SDK v2，1.3.0）
+"""media.dup-scan — STRM 重复查重（MT Python SDK v2，1.3.1）
 
 重构要点（对齐官方 Wiki SDK v2）：
 - 扫描默认走**本地快路径**（学 media.series-dedup）：宿主授权根为
@@ -35,7 +35,7 @@ from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, t
 from core.workscan import parse_work_dir, scan_work, summarize
 
 MANIFEST_ID = "media.dup-scan"
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.3.1"
 
 KV_CONFIG = "config"
 KV_CURRENT_SCAN = "currentScan"
@@ -54,7 +54,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "readStrmContent": True,
     "scanSource": None,   # {rootId, path}，上次选择的查重扫描目录
     "toolSource": None,   # {rootId, path}，上次选择的工具扫描目录
-    # 本地/网盘地址映射（series-dedup core/matcher.py:53-55 同款语义，无预设值，用户自填）
+    # 本地/网盘地址映射（series-dedup 同款语义，无预设值，用户自填；m01513 后删除不再用映射，保留供后续整理用）
     # 例：localDestDir=/strm/云盘影视  cloudDestDir=/小小玻珠/云盘影视
     "localDestDir": "",
     "cloudDestDir": "",
@@ -464,47 +464,17 @@ def _classify_strm_url(text: str) -> str:
     return "http" if t.lower().startswith(("http://", "https://")) else "local"
 
 
-def _same_stem_media_candidates(local_path: str, exts=("mkv", "mp4", "ts", "m2ts", "avi", "iso", "bdmv", "rmvb", "wmv", "flv", "mov")):
-    """本地删除：去除 .strm 后缀，同名媒体文件候选（绝对路径列表）。"""
-    if not local_path.lower().endswith(".strm"):
-        return []
-    stem = local_path[:-5]
-    return [stem + "." + e for e in exts]
-
-
-def _map_local_to_cloud(local_strm_abs: str, local_dest: str, cloud_dest: str) -> str | None:
-    """series-dedup 地址映射（core/submitter.py:to_mt_path 本地分支 + matcher local/cloud）：
-    把 /strm/云盘影视/... 的本地绝对路径换成网盘根下的同相对路径。
-    local_dest/cloud_dest 形如 /strm/云盘影视、/小小玻珠/云盘影视（无预设，用户自填）。
-    容器内 /strm 与宿主 /vol1/1000/strm 视为同一前缀。返回映射后的 MT 路径（以 / 开头），
-    无法映射返回 None。"""
-    if not local_dest or not cloud_dest or not local_strm_abs:
-        return None
-    # 归一本地前缀：/strm 与 /vol1/1000/strm 等价
-    cand = local_strm_abs
-    for pre in ("/vol1/1000/strm", "/strm"):
-        if cand.startswith(pre):
-            cand = "/strm" + cand[len(pre):]
-            break
-    ld = local_dest.rstrip("/")
-    if ld.startswith("/vol1/1000/strm"):
-        ld = "/strm" + ld[len("/vol1/1000/strm"):]
-    if not cand.startswith(ld):
-        return None
-    sub = cand[len(ld):]
-    if not sub.startswith("/"):
-        sub = "/" + sub
-    return cloud_dest.rstrip("/") + sub
 
 
 def _delete_by_content(
     ctx: Any, candidates: list[dict[str, Any]], purpose: str,
     local_dest: str = "", cloud_dest: str = "",
 ) -> dict[str, int]:
-    """按 STRM 内容分组删除（用户 m01409 需求 2）：
+    """按 STRM 内容分组删除（用户 m01409 需求 2，m01513 纠正本地分支）：
       - http(s) 分享：删 .strm 本体 + 同名 .nfo + 同名 -mediainfo.json；
-      - 本地：用地址映射把网盘路径换成本地同名媒体文件后删除该媒体文件
-        （series-dedup matcher/submitter 映射语义），删不到媒体文件时回退删 .strm 本体。
+      - 本地链接：STRM 内容即媒体真实路径（/CloudNAS/...），直接删该文件
+        （容器内 /CloudNAS 挂载，CD2 grpc 同步删云端），同时删 .strm + 附带文件。
+        不在 .strm 同目录找同名文件，不走地址映射。
     本地条目（_localPath）直接 os.remove；云端条目走 files.batch destination。
     """
     deleted = 0
@@ -554,53 +524,37 @@ def _delete_by_content(
                 else:
                     skipped += 1
         else:
-            # 本地：映射后删同名媒体文件；映射失败或媒体不存在回退删 strm 本体
-            mapped = None
-            media_abs = None
-            if local_path and local_dest and cloud_dest:
-                # local_path 形如 /vol1/1000/strm/云盘影视/.../x.strm -> 映射到 cloud 再反查本地媒体?
-                # 实际：本地 strm 内容是本地路径时，直接同目录找同名媒体；映射用于跨根定位
-                mapped = _map_local_to_cloud(local_path, local_dest, cloud_dest)
-            # 本地同名媒体：strm 去后缀 + 媒体后缀，同目录
-            cands = _same_stem_media_candidates(local_path) if local_path else []
-            found = next((c for c in cands if os.path.exists(c)), None)
-            if found:
-                local_removes.append(found)
-            elif mapped and local_dest:
-                # 映射到网盘路径后，网盘根下同名媒体：转回本地盘符尝试
-                # cloud_dest 形如 /小小玻珠/云盘影视，mapped 形如 /小小玻珠/云盘影视/.../x.strm
-                # 本地对应：/vol1/1000/strm + mapped 去 cloud 前缀? 仅当 cloud_dest 与 local_dest 同子路径时可换算
-                try:
-                    sub = mapped[len(cloud_dest.rstrip("/")):]
-                    alt_base = local_dest
-                    if alt_base.startswith("/strm"):
-                        alt_base = "/vol1/1000" + alt_base
-                    alt_strm = alt_base + sub
-                    for c in _same_stem_media_candidates(alt_strm):
-                        if os.path.exists(c):
-                            local_removes.append(c)
-                            found = c
-                            break
-                except Exception:
+            # 本地链接：STRM 内容就是媒体文件真实路径（如 /CloudNAS/...mkv，CD2 挂载）。
+            # 用户 m01513 纠正：直接删该媒体文件即可，CD2 grpc 会同步删云端；
+            # 不在 .strm 同目录找同名文件，也不走 /strm->/小小玻珠 地址映射（那是整理 destDir 用的）。
+            # 同时删 .strm 本体 + 同名 .nfo/-mediainfo.json，避免重复项残留。
+            content_path = (text or "").strip()
+            # 容器内 /CloudNAS 已挂载；宿主 /vol1/1000 前缀在容器内不存在，归一后优先原路径
+            media_candidates = []
+            if content_path:
+                media_candidates.append(content_path)
+                if content_path.startswith("/vol1/1000/"):
+                    media_candidates.append(content_path[len("/vol1/1000"):])
+            found_media = next((c for c in media_candidates if c and os.path.exists(c)), None)
+            if found_media:
+                local_removes.append(found_media)
+            # .strm 本体 + 附带文件（与 http 分支一致）
+            if local_path:
+                local_removes.append(local_path)
+                stem_lp = local_path[:-5] if local_path.lower().endswith(".strm") else local_path
+                local_removes.append(stem_lp + ".nfo")
+                local_removes.append(stem_lp + "-mediainfo.json")
+            elif root_id and rel:
+                stem_rel = rel[:-5] if rel.lower().endswith(".strm") else rel
+                for _t in (rel, stem_rel + ".nfo", stem_rel + "-mediainfo.json"):
+                    batch_items.append({"operation": "delete", "destination": {"rootId": root_id, "path": _t}, "recursive": False})
+                if not found_media and content_path:
+                    # 云端条目：内容路径不在本地挂载，无法 os.remove，仅删 strm（上已加 batch）
                     pass
-                if not found:
-                    if local_path:
-                        local_removes.append(local_path)
-                    elif root_id and rel:
-                        batch_items.append({"operation": "delete", "destination": {"rootId": root_id, "path": rel}, "recursive": False})
-                    elif ref:
-                        batch_items.append({"operation": "delete", "fileRef": ref})
-                    else:
-                        skipped += 1
+            elif ref:
+                batch_items.append({"operation": "delete", "fileRef": ref})
             else:
-                if local_path:
-                    local_removes.append(local_path)
-                elif root_id and rel:
-                    batch_items.append({"operation": "delete", "destination": {"rootId": root_id, "path": rel}, "recursive": False})
-                elif ref:
-                    batch_items.append({"operation": "delete", "fileRef": ref})
-                else:
-                    skipped += 1
+                skipped += 1
     # 本地删除
     for lp in local_removes:
         try:
