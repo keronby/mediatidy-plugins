@@ -23,7 +23,7 @@ from typing import Any
 
 from mt_plugin import Plugin as PluginBase, action, continuation, query, ui
 
-from core.nameinfo import extract_real_ext
+from core.nameinfo import extract_real_ext, parse as parse_strm_name
 from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, to_scorer_rules
 from core.workscan import parse_work_dir, scan_work, summarize
 
@@ -227,18 +227,43 @@ def _evaluate_works(
 ) -> list[dict[str, Any]]:
     """对每个作品目录用 core.workscan.scan_work 评分比对。
 
-    readStrmContent 开启且同作品 STRM >= 2 时，才对候选文件 readText
-    读取首行提取真实扩展名做 ISO 槽隔离；其余用文件后缀兜底。
+    快速原则（先文件名、后读内容）：
+      1. 纯本地按文件名预分组：剧集按 (季,集) S01E01、电影按同作品目录，
+         连集包/无集号文件不参与（与 scan_work 内部规则一致）。
+      2. 预分组后每桶 <2 的作品/集直接跳过，绝不 readText——这是 2003 个
+         文件 80 秒的主因（逐文件串行 RPC），现只读真正有重复候选的条目。
+      3. 只有候选条目才在 readStrmContent 开启时 readText 读首行提取真实
+         扩展名做 ISO 槽隔离；槽位（ISO/DV/HDR…）与总分比较仍由
+         scan_work + 规则 scoring 完成，行为与之前一致。
     """
     # rules 可能是列表（_resolve_rules 旧返回）或单 dict：只取第一条 dict
     if isinstance(rules, list):
         rules = next((r for r in rules if isinstance(r, dict)), None)
-    scorer_rules = to_scorer_rules(rules) if isinstance(rules, dict) and rules else to_scorer_rules(DEFAULT_FALLBACK_RULES[0])
-    groups: list[dict[str, Any]] = []
+    scorer_rules = (to_scorer_rules(rules) if isinstance(rules, dict) and rules else to_scorer_rules(DEFAULT_FALLBACK_RULES[0]))[0]  # to_scorer_rules returns (rules, unsupported, disabled); scan_work 只吃 rules dict
+    # 先纯本地预筛：只保留会出现重复组的条目（等价于 scan_work 的分组键去掉槽位）
+    candidates: dict[str, list[dict[str, Any]]] = {}
     for work_dir in sorted(works):
         entries = works[work_dir]
         if len(entries) < 2:
             continue
+        is_tv = any(parse_strm_name(e["name"]).get("episode") is not None for e in entries)
+        buckets: dict[Any, list[dict[str, Any]]] = {}
+        for e in entries:
+            info = parse_strm_name(e["name"])
+            if is_tv:
+                if info.get("episode") is None or info.get("isMulti"):
+                    continue
+                key = (info.get("season"), info.get("episode"))
+            else:
+                key = ("movie",)
+            buckets.setdefault(key, []).append(e)
+        keep_entries = [e for bucket in buckets.values() if len(bucket) >= 2 for e in bucket]
+        if keep_entries:
+            candidates[work_dir] = keep_entries
+    groups: list[dict[str, Any]] = []
+    total = len(candidates)
+    for done, work_dir in enumerate(sorted(candidates), 1):
+        entries = candidates[work_dir]
         if read_content:
             for entry in entries:
                 ref = entry.get("ref")
@@ -251,6 +276,7 @@ def _evaluate_works(
                 text = data.get("text", "") if isinstance(data, dict) else ""
                 entry["realExt"] = extract_real_ext(text) if text else ""
         groups.extend(scan_work(work_dir, entries, scorer_rules))
+        _progress(ctx, done, f"查重比对 {done}/{total}", total)
     return groups
 
 
@@ -310,8 +336,19 @@ def _delete_via_files_batch(
     return {"deleted": deleted, "skipped": skipped, "requested": len(candidates)}
 
 
-def _collect_task_items(ctx: Any, ref: str) -> list[dict[str, Any]]:
-    """分页拉取异步任务的全部文件条目。"""
+def _progress(ctx: Any, completed: int, message: str, total: int | None = None) -> None:
+    """runtime.progress 上报（action 通道，5000 次配额）；失败静默，禁止拖慢主流程。"""
+    try:
+        kwargs: dict[str, Any] = {"completed": int(completed), "message": str(message)[:200]}
+        if total is not None:
+            kwargs["total"] = int(total)
+        ctx.mt.runtime.progress(**kwargs)
+    except Exception:
+        pass
+
+
+def _collect_task_items(ctx: Any, ref: str, total_hint: int | None = None) -> list[dict[str, Any]]:
+    """分页拉取异步任务的全部文件条目（单页官方上限 100，不可调大）。"""
     out: list[dict[str, Any]] = []
     offset = 0
     for _ in range(500):
@@ -321,6 +358,7 @@ def _collect_task_items(ctx: Any, ref: str) -> list[dict[str, Any]]:
             break
         items = data.get("items", []) if isinstance(data, dict) else []
         out.extend(items)
+        _progress(ctx, len(out), "收集扫描结果", total_hint)
         next_offset = data.get("nextOffset") if isinstance(data, dict) else None
         if next_offset is None or next_offset <= offset:
             break
@@ -678,6 +716,8 @@ class Plugin(PluginBase):
         _persist_sources(ctx, cfg, source=source)
         _storage_set(ctx, KV_CONFIG, {k: cfg.get(k) for k in CONFIG_KEYS})
         run_id = f"scan-{uuid.uuid4().hex[:12]}"
+        # files.scan 的 query 是任务内搜索词（无官方文档/示例证明可按 *.strm 后缀过滤，
+        # 见 wiki business.md/capabilities.md），不可赌；仍全量扫、collect 端客户端过滤 .strm。
         task = ctx.mt.files.scan(
             root_id=source["rootId"],
             path=source["path"],
@@ -779,12 +819,16 @@ class Plugin(PluginBase):
         except Exception:
             task_refs = []
         rows: list[dict[str, Any]] = []
+        scanned = 0
         for ref in task_refs:
             for item in _collect_task_items(ctx, ref):
                 file = item.get("file") or {}
                 name = file.get("name", "")
                 if not name.lower().endswith(".strm") or file.get("isDir"):
                     continue
+                scanned += 1
+                if scanned % 50 == 1:
+                    _progress(ctx, scanned, f"检查非 HTTP 链接 {scanned}")
                 try:
                     data = ctx.mt.files.read_text(ref=file.get("ref", ""))
                 except Exception:
