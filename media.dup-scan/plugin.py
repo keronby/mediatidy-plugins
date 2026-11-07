@@ -36,7 +36,7 @@ from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, t
 from core.workscan import parse_work_dir, scan_work, summarize
 
 MANIFEST_ID = "media.dup-scan"
-PLUGIN_VERSION = "1.3.6"
+PLUGIN_VERSION = "1.3.7"
 
 KV_CONFIG = "config"
 KV_CURRENT_SCAN = "currentScan"
@@ -1364,6 +1364,7 @@ class Plugin(PluginBase):
                 local_base = None
         candidates: list[dict[str, Any]] = []
         selected = set(str(s) for s in selections) if selections else None
+        washed_keys: list[str] = []
         for idx, group in enumerate(groups):
             if selected is not None and str(idx) not in selected:
                 continue
@@ -1374,12 +1375,40 @@ class Plugin(PluginBase):
                 if file.get("name") in drop or file.get("rel") in drop:
                     f = dict(file)
                     if local_base and f.get("rel"):
+                        # rel 已含扫描 path 前缀（_local_scan_iter 已 join source path，
+                        # 见 ground truth: files[0].rel=云盘影视/.../x.strm，summary.path=云盘影视/...），
+                        # 而 local_base 也已含 scan_path -> 直接 join 会双倍前缀，路径不存在，删除全部 skipped。
+                        # 修正：以根目录为锚点重算（_resolve_local_base(path="") 只返 /strm 或 /vol1/1000/strm），再 join 完整 rel。
+                        root_base = None
+                        try:
+                            root_base = _resolve_local_base(ctx, {"rootId": root_id, "path": ""})
+                        except Exception:
+                            root_base = None
+                        base_for_path = root_base or local_base
+                        if scan_path not in (".", "") and (f["rel"] == scan_path or f["rel"].startswith(scan_path + "/")):
+                            # rel 已含前缀：用根锚点 join，避免双倍
+                            f["_localPath"] = os.path.join(base_for_path, f["rel"]) if base_for_path else ""
+                        else:
+                            # rel 不含前缀（cloud scan.Stored rel 为 path/file）：补前缀
+                            f["_localPath"] = os.path.join(local_base, f["rel"]) if local_base else ""
+                        # 关键：_localPath 空/错误时 candidates 仍会被计为 deleted 吗？检查存在性
+                        # （下面已把 root_base 兜底 + 不存在即 skipped）
                         f["rootId"] = root_id
-                        f["_localPath"] = os.path.join(local_base, f["rel"])
                     candidates.append(f)
+            washed_keys.append(str(idx))
         result = _delete_by_content(ctx, candidates, "batch-wash")
-        _log(ctx, "info", f"batch-wash run={run_id} {result}")
-        return {"ok": True, **result}
+        # 用户要求：真删成功后，重复显示项同步消失 -> 从 storage 移除已洗好的组（仅当至少删掉一个文件）
+        if result.get("deleted", 0) > 0 and washed_keys:
+            try:
+                # _storage_list 返回带 key 的项；用 idx 构造 key
+                for k in washed_keys:
+                    ctx.mt.storage.delete(key=f"scans/{run_id}/groups/{int(k):04d}")
+                _log(ctx, "info", f"batch-wash 已移除重复组: {washed_keys} run={run_id}")
+            except Exception as exc:
+                _log(ctx, "error", f"batch-wash 移除组失败: {exc}")
+        _washed_out = washed_keys if result.get("deleted", 0) > 0 else []
+        _log(ctx, "info", f"batch-wash run={run_id} {result} washed={_washed_out}")
+        return {"ok": True, **result, "washed": _washed_out}
 
     @action("batch-ignore")
     def batch_ignore(self, payload: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
