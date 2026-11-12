@@ -36,7 +36,7 @@ from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, t
 from core.workscan import parse_work_dir, scan_work, summarize
 
 MANIFEST_ID = "media.dup-scan"
-PLUGIN_VERSION = "1.4.1"
+PLUGIN_VERSION = "1.4.2"
 
 KV_CONFIG = "config"
 KV_CURRENT_SCAN = "currentScan"
@@ -55,7 +55,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ignoreDirs": ".recycle\n@recycle\n.trash\n$recycle.bin\n@eaDir",
     "localPathPrefix": "/CloudNAS",
     "ruleId": "auto",
-    "readStrmContent": True,
     "scanSource": None,   # {rootId, path}，上次选择的查重扫描目录
     "toolSource": None,   # {rootId, path}，上次选择的工具扫描目录
 }
@@ -125,7 +124,6 @@ def _cfg(ctx: Any) -> dict[str, Any]:
             if value is not None:
                 cfg[key] = value
     cfg["ruleId"] = str(cfg.get("ruleId") or "auto")
-    cfg["readStrmContent"] = bool(cfg.get("readStrmContent", True))
     # scanSource/toolSource 归一化（非法则丢弃，回落 None）
     cfg["scanSource"] = _clean_source(cfg.get("scanSource")) if cfg.get("scanSource") else None
     cfg["toolSource"] = _clean_source(cfg.get("toolSource")) if cfg.get("toolSource") else None
@@ -360,18 +358,14 @@ def _evaluate_works(
     ctx: Any,
     works: dict[str, list[dict[str, Any]]],
     rules: Any,
-    read_content: bool,
 ) -> list[dict[str, Any]]:
     """对每个作品目录用 core.workscan.scan_work 评分比对。
 
-    快速原则（先文件名、后读内容）：
+    快速原则（先文件名筛候选、后读内容分类）：
       1. 纯本地按文件名预分组：剧集按 (季,集) S01E01、电影按同作品目录，
          连集包/无集号文件不参与（与 scan_work 内部规则一致）。
-      2. 预分组后每桶 <2 的作品/集直接跳过，绝不 readText——这是 2003 个
-         文件 80 秒的主因（逐文件串行 RPC），现只读真正有重复候选的条目。
-      3. 只有候选条目才在 readStrmContent 开启时 readText 读首行提取真实
-         扩展名做 ISO 槽隔离；槽位（ISO/DV/HDR…）与总分比较仍由
-         scan_work + 规则 scoring 完成，行为与之前一致。
+      2. 预分组后每桶 <2 的作品/集直接跳过，不读取 STRM；只读重复候选。
+      3. 读取候选 STRM 首行，提取真实扩展名并参与槽位和评分分类。
     """
     # rules 可能是列表（_resolve_rules 旧返回）或单 dict：只取第一条 dict
     if isinstance(rules, list):
@@ -413,7 +407,7 @@ def _evaluate_works(
                     e["_info"] = parse_strm_name(e["name"])
             candidates[work_dir] = keep_entries
     # 查到重了才评分：委托 _evaluate_prepared（读内容 -> 槽位分组 -> <2 跳过 -> 打分）
-    return _evaluate_prepared(ctx, candidates, scorer_rules, read_content)
+    return _evaluate_prepared(ctx, candidates, scorer_rules)
 
 
 _SCORE_DIM_FIELDS = (
@@ -453,12 +447,11 @@ def _evaluate_prepared(
     ctx: Any,
     candidates: dict[str, list[dict[str, Any]]],
     scorer_rules: dict[str, Any],
-    read_content: bool,
 ) -> list[dict[str, Any]]:
     """先查重、后读内容、最后评分（用户口径 m01746）。
 
-    流程：候选桶已由 _evaluate_works 按文件名（季/集或同目录）分好 →
-    只对桶内条目读 STRM 首行取真实扩展名（ISO 槽）→ 按槽位分组 →
+    流程：候选桶按同目录、季/集与文件名分好 →
+    读取候选 STRM 首行确定分类和扩展名 → 按评分槽位分组 →
     每槽文件数 <2 直接跳过不评分 → 剩下的才 _score_entries 打分比对。
     2万文件场景：预筛 0.1s + 候选桶读首行 + 极少数评分，远低于逐文件全量 parse。
     """
@@ -473,14 +466,13 @@ def _evaluate_prepared(
         if done % 500 == 0 or done == total:
             _progress(ctx, done, f"查重比对 {done}/{total}", total)
         # 1) 读内容（仅候选桶，不全量）
-        if read_content:
-            for entry in entries:
-                text = _read_first_line(ctx, entry)
-                entry["strmKind"] = _classify_strm_url(text)
-                entry["realExt"] = extract_real_ext(text) if text else ""
-                # 槽位修正后需重解析 fileExtension，缓存失效则重 parse 一次
-                if entry.get("_info") is not None and entry["realExt"]:
-                    entry["_info"] = parse_strm_name(entry["name"], real_ext=entry["realExt"])
+        for entry in entries:
+            text = _read_first_line(ctx, entry)
+            entry["strmKind"] = _classify_strm_url(text)
+            entry["realExt"] = extract_real_ext(text) if text else ""
+            # 槽位修正后需重解析 fileExtension，缓存失效则重 parse 一次
+            if entry.get("_info") is not None and entry["realExt"]:
+                entry["_info"] = parse_strm_name(entry["name"], real_ext=entry["realExt"])
         # 2) 预解析（候选才 full parse，缓存供评分复用）
         for entry in entries:
             if entry.get("_info") is None:
@@ -597,10 +589,6 @@ class Plugin(PluginBase):
         for key in ("ignorePaths", "ignoreDirs", "localPathPrefix"):
             if key in config and not isinstance(config[key], str):
                 errors[key] = "必须是字符串"
-        for key in ("readStrmContent",):
-            value = config.get(key)
-            if value is not None and not isinstance(value, bool):
-                errors[key] = "必须是布尔值"
         for key in ("scanSource", "toolSource"):
             value = config.get(key)
             if value is None:
@@ -661,7 +649,6 @@ class Plugin(PluginBase):
             ui.Textarea(label="忽略目录名（每行一个）", bind="state.ignoreDirs"),
             ui.Textarea(label="忽略目录（每行一个根内相对路径）", bind="state.ignorePaths"),
             ui.Select(label="查重规则", bind="state.ruleId", options=rule_options),
-            ui.Checkbox(label="读取 STRM 首行做扩展名槽隔离", bind="state.readStrmContent"),
             ui.Stack(
                 ui.Button(
                     label=ui.expr("if", is_scan_running, "⏳ 正在查重扫描中...", "开始查重"),
@@ -669,7 +656,7 @@ class Plugin(PluginBase):
                     disabled=is_scan_running,
                     loading=is_scan_running,
                     onClick=[
-                        {"type": "invoke", "actionId": "dup-scan", "input": {"source": ui.ref("state.source"), "ruleId": ui.ref("state.ruleId"), "readStrmContent": ui.ref("state.readStrmContent"), "ignorePaths": ui.ref("state.ignorePaths"), "ignoreDirs": ui.ref("state.ignoreDirs")}},
+                        {"type": "invoke", "actionId": "dup-scan", "input": {"source": ui.ref("state.source"), "ruleId": ui.ref("state.ruleId"), "ignorePaths": ui.ref("state.ignorePaths"), "ignoreDirs": ui.ref("state.ignoreDirs")}},
                         {"type": "query", "queryId": "summary"},
                         {"type": "query", "queryId": "rules"},
                     ],
@@ -817,7 +804,6 @@ class Plugin(PluginBase):
                 "tool_source": cfg.get("toolSource"),
                 "selected_tool_ids": [],
                 "ruleId": cfg.get("ruleId", "auto"),
-                "readStrmContent": cfg.get("readStrmContent", True),
                 "selected_wash_ids": [], "selected_local_ids": [],
                 "busy": False,
             },
@@ -939,7 +925,6 @@ class Plugin(PluginBase):
         for key in CONFIG_KEYS:
             if key in payload:
                 cfg[key] = payload[key]
-        cfg["readStrmContent"] = bool(cfg.get("readStrmContent", True))
         if "scanSource" in payload:
             cfg["scanSource"] = _clean_source(payload.get("scanSource"))
         if "toolSource" in payload:
@@ -975,8 +960,6 @@ class Plugin(PluginBase):
             raise ValueError("请先在页面选择有效的扫描目录（DirectoryPicker）")
         if payload.get("ruleId"):
             cfg["ruleId"] = str(payload["ruleId"])
-        if "readStrmContent" in payload:
-            cfg["readStrmContent"] = bool(payload["readStrmContent"])
         if "ignorePaths" in payload:
             cfg["ignorePaths"] = str(payload["ignorePaths"])
         _persist_sources(ctx, cfg, source=source)
@@ -1028,14 +1011,13 @@ class Plugin(PluginBase):
         # 流式按作品目录连续聚合：os.walk 按目录序，同一 work_dir 连续出现，变化即刷（内存 O(单作品) 而非 O(全库)）
         all_rules, chosen = _resolve_rules(ctx, cfg)
         scorer = chosen if isinstance(chosen, dict) and chosen else all_rules
-        read_content = bool(cfg.get("readStrmContent", True))
         groups: list[dict[str, Any]] = []
         strm_count = 0
         cur_work = ""
         cur_entries: list[dict[str, Any]] = []
         def _flush():
             if cur_entries:
-                groups.extend(_evaluate_works(ctx, {cur_work: list(cur_entries)}, scorer, read_content))
+                groups.extend(_evaluate_works(ctx, {cur_work: list(cur_entries)}, scorer))
         for entry in _local_scan_iter(ctx, source, local_base):
             strm_count += 1
             wd = _work_dir_of(entry["rel"])
@@ -1069,7 +1051,6 @@ class Plugin(PluginBase):
             task_refs = []
         summary = _storage_get(ctx, f"scans/{run_id}/summary", default={}) or {}
         cfg = summary.get("config") or _cfg(ctx)
-        read_content = bool(cfg.get("readStrmContent", True))
         all_rules, _chosen = _resolve_rules(ctx, cfg)
         works: dict[str, list[dict[str, Any]]] = {}
         strm_count = 0
@@ -1094,7 +1075,7 @@ class Plugin(PluginBase):
                     "ref": file.get("ref", ""), "version": file.get("version", ""),
                     "rootId": file.get("rootId", summary.get("rootId", "")),
                 })
-        groups = _evaluate_works(ctx, works, _chosen if isinstance(_chosen, dict) and _chosen else all_rules, read_content)
+        groups = _evaluate_works(ctx, works, _chosen if isinstance(_chosen, dict) and _chosen else all_rules)
         stored = _store_groups(ctx, run_id, groups)
         stats = summarize(groups)
         _storage_set(ctx, f"scans/{run_id}/summary", {
