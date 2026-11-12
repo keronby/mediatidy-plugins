@@ -1,7 +1,7 @@
 {
   "id": "media.dup-scan",
   "name": "STRM 重复扫描",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "sdkVersion": "2",
   "entry": "plugin.py:Plugin",
   "description": "在作品目录内扫描重复 STRM，按 MediaTidy 评分规则与多版本槽位识别应保留/应删除版本。本地根（strm）走本地快路径 os.walk 遍历，绕过宿主逐文件审计（50w+ 库秒级）；云盘根走宿主 files.scan 异步任务。删除按 STRM 内容分组：http 分享删 .strm+.nfo+-mediainfo.json；本地链接直接删 STRM 内容指向的媒体文件路径（CD2 挂载，同步删云端），同时删 .strm 本体与附带文件。",
@@ -54,28 +54,6 @@
       },
       "ignoreDirs": {
         "type": "string"
-      },
-      "isoMode": {
-        "type": "string",
-        "enum": [
-          "same_dir",
-          "other_dir",
-          "no_import"
-        ]
-      },
-      "scanSources": {
-        "type": "array",
-        "items": {
-          "type": "object",
-          "properties": {
-            "path": {
-              "type": "string"
-            },
-            "rootId": {
-              "type": "string"
-            }
-          }
-        }
       }
     }
   },
@@ -122,28 +100,6 @@
           },
           "ignoreDirs": {
             "type": "string"
-          },
-          "isoMode": {
-            "type": "string",
-            "enum": [
-              "same_dir",
-              "other_dir",
-              "no_import"
-            ]
-          },
-          "scanSources": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "path": {
-                  "type": "string"
-                },
-                "rootId": {
-                  "type": "string"
-                }
-              }
-            }
           }
         }
       },
@@ -180,36 +136,6 @@
           },
           "ignoreDirs": {
             "type": "string"
-          },
-          "isoMode": {
-            "type": "string",
-            "enum": [
-              "same_dir",
-              "other_dir",
-              "no_import"
-            ]
-          },
-          "source2": {
-            "type": "object",
-            "properties": {
-              "path": {
-                "type": "string"
-              },
-              "rootId": {
-                "type": "string"
-              }
-            }
-          },
-          "source3": {
-            "type": "object",
-            "properties": {
-              "path": {
-                "type": "string"
-              },
-              "rootId": {
-                "type": "string"
-              }
-            }
           }
         }
       },
@@ -477,16 +403,7 @@
         "additionalProperties": true
       },
       "inputSchema": {
-        "type": "object",
-        "properties": {
-          "search": {
-            "type": "string"
-          },
-          "page": {
-            "type": "integer",
-            "minimum": 1
-          }
-        }
+        "type": "object"
       }
     }
   ],

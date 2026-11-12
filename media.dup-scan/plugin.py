@@ -36,7 +36,7 @@ from core.rules import DEFAULT_FALLBACK_RULES, get_rule_by_id, load_all_rules, t
 from core.workscan import parse_work_dir, scan_work, summarize
 
 MANIFEST_ID = "media.dup-scan"
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 
 KV_CONFIG = "config"
 KV_CURRENT_SCAN = "currentScan"
@@ -52,9 +52,7 @@ COMPANION_EXTS = (".nfo", "-mediainfo.json")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "ignorePaths": "",
-    "isoMode": "same_dir",
     "ignoreDirs": ".recycle\n@recycle\n.trash\n$recycle.bin\n@eaDir",
-    "scanSources": [],
     "localPathPrefix": "/CloudNAS",
     "ruleId": "auto",
     "readStrmContent": True,
@@ -180,13 +178,10 @@ def _fast_episode(name: str):
 
 
 def _work_dir_of(file_path: str) -> str:
-    """向上找含 [tmdbid-…] 的作品目录；file_path 为 root 相对路径。"""
-    parts = [p for p in str(file_path).split("/") if p not in ("", ".")]
-    for i in range(len(parts) - 1, 0, -1):
-        candidate = "/".join(parts[:i])
-        if parse_work_dir(candidate.rsplit("/", 1)[-1]):
-            return candidate
-    return "/".join(parts[:-1]) if len(parts) > 1 else "."
+    """Return the immediate parent: duplicates never span directories."""
+    import posixpath
+    return posixpath.dirname(str(file_path)) or "."
+
 
 
 def _compact_file(item: dict[str, Any]) -> dict[str, Any]:
@@ -473,7 +468,6 @@ def _evaluate_prepared(
     groups: list[dict[str, Any]] = []
     total = len(candidates)
     min_diff = float(scorer_rules.get("min_score_diff") or 0)
-    iso_mode = _cfg(ctx).get("isoMode", "same_dir")
     for done, work_dir in enumerate(sorted(candidates), 1):
         entries = candidates[work_dir]
         if done % 500 == 0 or done == total:
@@ -500,8 +494,6 @@ def _evaluate_prepared(
         for entry in entries:
             info = entry["_info"]
             slot = __import__("core.workscan", fromlist=["_slot_of"])._slot_of(info, scorer_rules.get("slots") or [])
-            if iso_mode != "same_dir" and slot.upper() in ("ISO", "BDMV", "原盘"):
-                slot = "default"
             ep, season = info.get("episode"), info.get("season")
             if is_tv:
                 if ep is None or info.get("isMulti"):
@@ -602,7 +594,7 @@ class Plugin(PluginBase):
         rule_id = config.get("ruleId")
         if rule_id is not None and not isinstance(rule_id, str):
             errors["ruleId"] = "规则 ID 必须是字符串"
-        for key in ("ignorePaths", "ignoreDirs", "localPathPrefix", "isoMode"):
+        for key in ("ignorePaths", "ignoreDirs", "localPathPrefix"):
             if key in config and not isinstance(config[key], str):
                 errors[key] = "必须是字符串"
         for key in ("readStrmContent",):
@@ -666,10 +658,7 @@ class Plugin(PluginBase):
 
         dup_settings = ui.Section(
             ui.DirectoryPicker(label="扫描目录", bind="state.source"),
-            ui.DirectoryPicker(label="附加扫描目录 2（可选）", bind="state.source2"),
-            ui.DirectoryPicker(label="附加扫描目录 3（可选）", bind="state.source3"),
             ui.Textarea(label="忽略目录名（每行一个）", bind="state.ignoreDirs"),
-            ui.Select(label="ISO 模式", bind="state.isoMode", options=[{"label": "同目录共存（隔离 ISO）", "value": "same_dir"}, {"label": "异目录（普通比较）", "value": "other_dir"}, {"label": "不入库（普通比较）", "value": "no_import"}]),
             ui.Textarea(label="忽略目录（每行一个根内相对路径）", bind="state.ignorePaths"),
             ui.Select(label="查重规则", bind="state.ruleId", options=rule_options),
             ui.Checkbox(label="读取 STRM 首行做扩展名槽隔离", bind="state.readStrmContent"),
@@ -680,7 +669,7 @@ class Plugin(PluginBase):
                     disabled=is_scan_running,
                     loading=is_scan_running,
                     onClick=[
-                        {"type": "invoke", "actionId": "dup-scan", "input": {"source": ui.ref("state.source"), "ruleId": ui.ref("state.ruleId"), "readStrmContent": ui.ref("state.readStrmContent"), "ignorePaths": ui.ref("state.ignorePaths"), "ignoreDirs": ui.ref("state.ignoreDirs"), "isoMode": ui.ref("state.isoMode"), "source2": ui.ref("state.source2"), "source3": ui.ref("state.source3")}},
+                        {"type": "invoke", "actionId": "dup-scan", "input": {"source": ui.ref("state.source"), "ruleId": ui.ref("state.ruleId"), "readStrmContent": ui.ref("state.readStrmContent"), "ignorePaths": ui.ref("state.ignorePaths"), "ignoreDirs": ui.ref("state.ignoreDirs")}},
                         {"type": "query", "queryId": "summary"},
                         {"type": "query", "queryId": "rules"},
                     ],
@@ -816,17 +805,11 @@ class Plugin(PluginBase):
         tool_tab = ui.Tab(tool_settings, tool_overview, tool_actions, tool_table, id="tab-tool", label="🔧 CD2 排除")
 
         return ui.page(
-            ui.Input(label="搜索作品、路径或版本", bind="state.search"),
-            ui.Input(label="结果页码（每页 20 条）", type="number", bind="state.page"),
             ui.Button(label="查询结果", onClick=[{"type": "query", "queryId": "summary"}]),
-            ui.Text(text=ui.ref("query.summary.data.pageLine")),
             ui.Tabs(dup_tab, tool_tab, bind="state.activeTab"),
             ui.Details(ui.Text(text=ui.ref("query.summary.data.lastDeletion")), label="最近删除预览 / 执行结果"),
             state={
-                "search": "", "page": 1,
-                "source2": (cfg.get("scanSources") or [None, None])[1] if len(cfg.get("scanSources") or []) > 1 else None,
-                "source3": (cfg.get("scanSources") or [None, None, None])[2] if len(cfg.get("scanSources") or []) > 2 else None,
-                "ignoreDirs": cfg.get("ignoreDirs", ""), "isoMode": cfg.get("isoMode", "same_dir"),
+                "ignoreDirs": cfg.get("ignoreDirs", ""),
                 "activeTab": "tab-dup",
                 "ignorePaths": cfg.get("ignorePaths", ""),
                 "localPathPrefix": cfg.get("localPathPrefix", "/CloudNAS"),
@@ -838,7 +821,7 @@ class Plugin(PluginBase):
                 "selected_wash_ids": [], "selected_local_ids": [],
                 "busy": False,
             },
-            queries=[{"id": "rules", "name": "rules"}, {"id": "summary", "name": "summary", "input": {"search": ui.ref("state.search"), "page": ui.ref("state.page")}}],
+            queries=[{"id": "rules", "name": "rules"}, {"id": "summary", "name": "summary"}],
         )
 
 
@@ -938,23 +921,14 @@ class Plugin(PluginBase):
         overview_line = "共 %d 组重复判定（%d 条明细）" % (total, len(rows)) if rows else "本次未发现重复组"
         http_items = [r for r in rows if r.get("dropKind") == "http"]
         local_items = [r for r in rows if r.get("dropKind") != "http"]
-        payload = payload or {}
-        search = str(payload.get("search") or "").casefold()
-        if search:
-            http_items = [r for r in http_items if search in str(r).casefold()]
-            local_items = [r for r in local_items if search in str(r).casefold()]
-            tool_rows = [r for r in tool_rows if search in str(r).casefold()]
         http_total, local_total = len(http_items), len(local_items)
-        page = max(1, int(payload.get("page") or 1))
-        offset = (page - 1) * 20
-        pages = max(1, (max(http_total, local_total, len(tool_rows)) + 19) // 20)
         last = _storage_get(ctx, "lastDeletion", default={}) or {}
         import json
         preview = json.dumps(last, ensure_ascii=False, indent=2)
-        return {"items": [], "httpItems": http_items[offset:offset+20], "localItems": local_items[offset:offset+20],
-                "pageLine": f"第 {page} 页 / {pages} 页（每类每页 20 条）", "lastDeletion": preview,
+        return {"items": [], "httpItems": http_items, "localItems": local_items,
+                "lastDeletion": preview,
                 "httpTotal": http_total, "localTotal": local_total,
-                "toolItems": tool_rows[offset:offset+20], "total": total,
+                "toolItems": tool_rows, "total": total,
                 "toolTotal": tool_count, "overviewLine": overview_line, "toolSummary": tool_summary, "runId": run_id}
 
     # -- Actions ---------------------------------------------------------
@@ -1007,42 +981,10 @@ class Plugin(PluginBase):
             cfg["ignorePaths"] = str(payload["ignorePaths"])
         _persist_sources(ctx, cfg, source=source)
         _storage_set(ctx, KV_CONFIG, {k: cfg.get(k) for k in CONFIG_KEYS})
-        for option in ("ignoreDirs", "isoMode"):
-            if option in payload:
-                cfg[option] = payload[option]
-        sources = [source] + [v for v in (_clean_source(payload.get("source2")), _clean_source(payload.get("source3"))) if v]
-        sources = list({(v["rootId"], v["path"]): v for v in sources}.values())
-        cfg["scanSources"] = sources
+        if "ignoreDirs" in payload:
+            cfg["ignoreDirs"] = str(payload["ignoreDirs"])
         _storage_set(ctx, KV_CONFIG, {k: cfg.get(k) for k in CONFIG_KEYS})
         run_id = f"scan-{uuid.uuid4().hex[:12]}"
-        if len(sources) > 1:
-            bases = [_resolve_local_base(ctx, v) for v in sources]
-            if not all(bases):
-                raise ValueError("多路径快速扫描目前要求所有目录均为本地授权根；云端请分次扫描")
-            _storage_set(ctx, "activeScan", run_id)
-            _storage_set(ctx, f"scans/{run_id}/summary", {"state": "running", "sources": sources})
-            count = 0
-            seen: set[tuple[str, str]] = set()
-            works: dict[tuple[str, str], list[dict[str, Any]]] = {}
-            rules, chosen = _resolve_rules(ctx, cfg)
-            for selected_source, base in zip(sources, bases):
-                assert base is not None
-                for entry in _local_scan_iter(ctx, selected_source, base):
-                    identity = (entry["rootId"], entry["rel"])
-                    if identity in seen:
-                        continue
-                    seen.add(identity)
-                    count += 1
-                    directory = _work_dir_of(entry["rel"])
-                    # Root is part of the identity: separate mounts are not the same directory.
-                    works.setdefault((entry["rootId"], directory), []).append(entry)
-            groups = []
-            for (_, directory), entries in works.items():
-                groups.extend(_evaluate_works(ctx, {directory: entries}, chosen or rules, bool(cfg["readStrmContent"])))
-            stored = _store_groups(ctx, run_id, groups)
-            _storage_set(ctx, f"scans/{run_id}/summary", {"state": "done", "sources": sources, "storedGroups": stored, "strmCount": count})
-            _storage_set(ctx, KV_CURRENT_SCAN, run_id)
-            return {"ok": True, "runId": run_id, "storedGroups": stored, "strmCount": count}
         # 本地快路径优先（local 根 strm）：同步本地遍历后直接比对，不经 tasks。
         local_base = _resolve_local_base(ctx, source)
         if local_base:
