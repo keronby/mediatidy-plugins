@@ -166,11 +166,6 @@ def _decide(files: List[_File], min_diff: float) -> Tuple[Optional[_File], Optio
         return best, second, "same", diff
     if diff >= min_diff:
         return best, second, "keep", diff
-    # 分差不足（tie）：同分/近平分时同样默认本地路径为失败者，
-    # 避免因解析不到细节把分享链接误判为失败。
-    if {best.kind, second.kind} == {"http", "local"}:
-        keeper, loser = (best, second) if best.kind == "http" else (second, best)
-        return keeper, loser, "keep", diff
     return best, second, "tie", diff
 
 

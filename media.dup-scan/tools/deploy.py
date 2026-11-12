@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""把 dist/media.dup-scan-1.0.0.zip 装进 MediaTidy 并启用。
+"""Install or update media.dup-scan without removing instance data.
 
-分三步（顺序不能乱，都是踩坑换来的）：
-  1. inspect/upload —— 上传拿到 ticket，否则 install 404
-  2. install —— grants 只传权限布尔（多传 capabilities/roots 会被拒）
-  3. PUT /api/plugins/<id> —— 只传 enabled+config+grants。
-     **不能只传 enabled**，否则 grants 被清空，插件拿不到 rules.read 等能力。
+Same-source updates preserve the existing config and grants. New permissions
+are reported for explicit review instead of being silently granted.
 """
 import json, os, sys, time, requests
 
@@ -21,38 +18,66 @@ def main(zip_path):
     s.headers["Authorization"] = "Bearer " + tok
     P = "%s/plugins/%s" % (MT, PLUGIN)
 
-    s.delete(P, timeout=60)
-    time.sleep(2)
+    existing_resp = s.get(P, timeout=60)
+    if existing_resp.status_code not in (200, 404):
+        sys.exit("无法读取现有实例，拒绝继续：" + str(existing_resp.status_code))
+    existing = existing_resp.json().get("data") if existing_resp.status_code == 200 else None
 
     with open(zip_path, "rb") as f:
         d = s.post(MT + "/plugins/inspect/upload", files={"file": ("p.zip", f, "application/zip")}, timeout=180).json()["data"]
     perm = d["release"]["manifest"]["permissions"]
     print("permissions:", perm)
 
-    s.post(MT + "/plugins/install", json={"ticket": d["ticket"], "grants": {p: True for p in perm}, "config": {}}, timeout=180)
-    for _ in range(20):
+    config = {}
+    grants = {}
+    if existing:
+        old_permissions = set((existing.get("manifest") or {}).get("permissions", []))
+        missing = set(perm) - old_permissions
+        if missing:
+            sys.exit("更新需要新增权限，请先在 MediaTidy 审阅并授予：" + ", ".join(sorted(missing)))
+        config = existing.get("config") or {}
+        grants = existing.get("grants") or {}
+    # Upload inspection alone does not update installed code: consume the ticket
+    # for BOTH installations and upgrades. Never DELETE the existing instance.
+    result = s.post(MT + "/plugins/install", json={"ticket": d["ticket"],
+                    "grants": grants if existing else {"capabilities": perm},
+                    "config": config}, timeout=180)
+    if result.status_code >= 400:
+        sys.exit("安装/更新失败：" + result.text[:500])
+    for _ in range(60):
         time.sleep(3)
-        if s.get(P, timeout=60).status_code == 200:
-            break
+        installed = s.get(P, timeout=60)
+        if installed.status_code == 200:
+            current = installed.json().get("data") or {}
+            if (current.get("manifest") or {}).get("version") == d["release"]["manifest"]["version"]:
+                break
     else:
-        sys.exit("安装超时：插件未出现在列表里")
+        sys.exit("安装/更新超时：宿主尚未加载目标版本；未修改配置或授权")
 
-    # 自动拉取系统当前所有的整理方案 ID 授权给插件
-    prof_resp = s.get(MT + "/organize/profiles", timeout=10)
-    pids = []
-    if prof_resp.status_code == 200:
-        p_items = prof_resp.json().get("data") or []
-        pids = [p["id"] for p in p_items if isinstance(p, dict) and "id" in p]
-
-    grants = {
-        "autoProfileIds": [], "profileRevisions": {}, "strmRevisions": {},
-        "capabilities": perm,
-        "roots": [{"read": True, "write": True, "delete": True,
-                   "id": "root-strm", "name": "strm", "path": ROOT, "storageType": "local"}],
-        "profileIds": pids, "strmProfileIds": pids, "channelIds": [], "http": None,
-    }
-    r = s.put(P, json={"enabled": True, "config": {}, "grants": grants}, timeout=120)
-    print("enable:", r.status_code)
+    if not existing:
+        # New installs receive only the permissions declared by this release.
+        # Existing instances retain their exact grants/configuration above.
+        grants = {
+            "autoProfileIds": [], "profileRevisions": {}, "strmRevisions": {},
+            "capabilities": perm,
+            "roots": [{"read": True, "write": True, "delete": True,
+                       "id": "root-strm", "name": "strm", "path": ROOT,
+                       "storageType": "local"}],
+            "profileIds": [], "strmProfileIds": [], "channelIds": [], "http": None,
+        }
+    if existing:
+        current = s.get(P, timeout=60).json()["data"]
+        for field in ("instanceId", "config", "grants", "enabled"):
+            if current.get(field) != existing.get(field):
+                sys.exit("更新后实例字段发生变化，请检查：" + field)
+        if current.get("grants") is None:
+            sys.exit("更新后宿主未返回授权，拒绝继续")
+        print("实例与配置保留；授权由宿主按现有授权规范化返回")
+    else:
+        r = s.put(P, json={"enabled": True, "config": config, "grants": grants}, timeout=120)
+        if r.status_code >= 400:
+            sys.exit("启用插件失败：" + r.text[:500])
+        print("enable:", r.status_code)
 
     ui = s.get(P + "/ui", timeout=60)
     print("ui:", ui.status_code, len(ui.text), "字节")
@@ -60,4 +85,4 @@ def main(zip_path):
     print("rules:", json.dumps(q, ensure_ascii=False)[:300])
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "dist", "media.dup-scan-1.3.7.zip"))
+    main(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "dist", "media.dup-scan-1.4.0.zip"))

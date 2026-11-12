@@ -4,6 +4,11 @@ from core import nameinfo, rules as rulelib, workscan
 
 
 class TestExtAndSlot(unittest.TestCase):
+    def test_long_episode_numbers_and_ranges(self):
+        self.assertEqual(nameinfo.parse_episode("Show.S02E12345.mkv")["episode"], 12345)
+        parsed = nameinfo.parse_episode("Show.S02E01-E08.mkv")
+        self.assertEqual((parsed["episode"], parsed["episodeEnd"], parsed["isMulti"]), (1, 8, True))
+
     def test_extract_real_ext(self):
         # 1. 本地/云盘路径
         p1 = "/CloudNAS/media/茶之味.2004.1080p.iso"
