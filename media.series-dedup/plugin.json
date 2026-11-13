@@ -1,119 +1,468 @@
 {
   "id": "media.series-dedup",
-  "name": "剧集查重（影视重整分流）",
-  "version": "1.0.0",
+  "name": "影视查重",
+  "version": "1.4.12",
   "sdkVersion": "2",
-  "author": "keronby",
-  "description": "按 TMDB ID 扫描电影/电视剧目录，比对 TMDB 最新标题/年份，按 STRM 链接属性（分享链/云盘链/混合链）自动分流重整任务。",
   "entry": "plugin.py:Plugin",
+  "description": "智能扫描电影与电视剧目录，基于 TMDB 官方元数据识别多版本重复，按 STRM 链接属性（分享链/云盘链/混合链）自动分流重整任务。支持直接下拉选取整理方案。",
+  "author": "keronby",
   "permissions": [
     "files.read",
     "storage",
-    "rules.read",
     "organize.read",
-    "organize.run",
     "tasks.read",
-    "tasks.wait"
+    "tasks.wait",
+    "organize.manual.run",
+    "files.delete",
+    "tmdb.read",
+    "rules.read"
   ],
-  "config": [
-    {
-      "key": "debugMode",
-      "label": "调试模式（只读模拟，不实际提交整理）",
-      "type": "boolean",
-      "default": true
-    },
-    {
-      "key": "rootPath",
-      "label": "扫描根目录",
-      "type": "text"
-    },
-    {
-      "key": "localProfileId",
-      "label": "本地整理方案 ID（http分享链）",
-      "type": "text",
-      "default": "1359"
-    },
-    {
-      "key": "localDestDir",
-      "label": "本地整理目标目录",
-      "type": "text"
-    },
-    {
-      "key": "cloudProfileId",
-      "label": "云盘整理方案 ID（cloudnas本地链）",
-      "type": "text",
-      "default": "854"
-    },
-    {
-      "key": "cloudDestDir",
-      "label": "云盘整理目标目录",
-      "type": "text"
-    },
-    {
-      "key": "forceRefreshTmdb",
-      "label": "比对前强制刷新 TMDB 官方缓存",
-      "type": "boolean",
-      "default": true
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+      "rootBindings": {
+        "type": "array",
+        "maxItems": 30,
+        "items": {
+          "type": "object",
+          "properties": {
+            "rootId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "mountPath": {
+              "type": "string",
+              "minLength": 2
+            }
+          },
+          "required": [
+            "rootId",
+            "mountPath"
+          ],
+          "additionalProperties": false
+        }
+      }
     }
-  ],
+  },
   "actions": [
     {
       "id": "scan",
-      "label": "开始查重扫描",
-      "fields": [
-        {
-          "key": "scanPath",
-          "label": "扫描目录路径",
-          "type": "text",
-          "required": false
-        }
-      ],
+      "label": "开始全量扫描与比对",
       "inputSchema": {
         "type": "object",
         "properties": {
-          "scanPath": {
+          "localProfileId": {
+            "type": "number"
+          },
+          "cloudProfileId": {
+            "type": "number"
+          },
+          "tmdb_style": {
             "type": "string"
+          },
+          "scanPath": {
+            "type": "string",
+            "minLength": 1
           }
         },
-        "additionalProperties": true
-      },
-      "outputSchema": {
-        "type": "object",
-        "additionalProperties": true
+        "additionalProperties": false
       }
     },
     {
       "id": "refresh-tmdb",
-      "label": "刷新 TMDB 缓存",
-      "fields": [],
+      "label": "重新查询 TMDB 元数据（非强制刷新）"
+    },
+    {
+      "id": "save-config",
+      "label": "保存工作台业务配置",
       "inputSchema": {
         "type": "object",
-        "additionalProperties": true
-      },
-      "outputSchema": {
-        "type": "object",
-        "additionalProperties": true
+        "properties": {
+          "localProfileId": {
+            "type": "number"
+          },
+          "cloudProfileId": {
+            "type": "number"
+          },
+          "localDestDir": {
+            "type": "string"
+          },
+          "cloudDestDir": {
+            "type": "string"
+          },
+          "strmLocalPrefix": {
+            "type": "string"
+          },
+          "strmCloudPrefix": {
+            "type": "string"
+          },
+          "tmdb_style": {
+            "type": "string"
+          },
+          "tmdbStyle": {
+            "type": "string"
+          },
+          "strm_local_prefix": {
+            "type": "string"
+          },
+          "strm_cloud_prefix": {
+            "type": "string"
+          },
+          "scanPath": {
+            "type": "string",
+            "minLength": 1
+          },
+          "qualityRuleId": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       }
     },
     {
       "id": "submit-organize",
-      "label": "提交分流重整",
+      "label": "执行分流重整",
       "fields": [
         {
-          "key": "category",
-          "label": "分类类型",
-          "type": "text",
-          "required": false
+          "key": "confirm",
+          "label": "确认提交批量重整任务",
+          "type": "boolean",
+          "default": false
         }
-      ],
+      ]
+    },
+    {
+      "id": "submit-single",
+      "label": "单项手动提交重整",
+      "fields": [
+        {
+          "key": "localPath",
+          "label": "本地目录路径",
+          "type": "text"
+        },
+        {
+          "key": "linkType",
+          "label": "链接类型",
+          "type": "text",
+          "default": "http"
+        },
+        {
+          "key": "strmSource",
+          "label": "STRM 源地址",
+          "type": "text"
+        },
+        {
+          "key": "cloudnasPath",
+          "label": "云盘对应源目录",
+          "type": "text"
+        },
+        {
+          "key": "profileId",
+          "label": "整理方案ID",
+          "type": "number"
+        },
+        {
+          "key": "destDir",
+          "label": "目标目录",
+          "type": "text"
+        },
+        {
+          "key": "mediaType",
+          "label": "媒体类型",
+          "type": "text",
+          "default": "tv"
+        },
+        {
+          "key": "tmdbId",
+          "label": "TMDB ID",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "id": "clear",
+      "label": "清空扫描结果与日志"
+    },
+    {
+      "id": "delete-single",
+      "label": "单项删除影视作品目录",
+      "fields": [
+        {
+          "key": "localPath",
+          "label": "本地目录路径",
+          "type": "text"
+        },
+        {
+          "key": "linkType",
+          "label": "链接类型(http或cloudnas)",
+          "type": "text",
+          "default": "http"
+        }
+      ]
+    },
+    {
+      "id": "batch-submit",
+      "label": "批量提交选定条目重整",
+      "fields": [
+        {
+          "key": "selectedPaths",
+          "label": "选中的路径列表",
+          "type": "stringList"
+        },
+        {
+          "key": "linkType",
+          "label": "链接类型",
+          "type": "text",
+          "default": "http"
+        }
+      ]
+    },
+    {
+      "id": "batch-delete",
+      "label": "批量彻底删除选定影视作品",
+      "fields": [
+        {
+          "key": "selectedPaths",
+          "label": "选中的路径列表",
+          "type": "stringList"
+        },
+        {
+          "key": "linkType",
+          "label": "链接类型",
+          "type": "text",
+          "default": "http"
+        }
+      ]
+    },
+    {
+      "id": "protect-item",
+      "label": "将选定作品收入保护组",
+      "fields": [
+        {
+          "key": "localPath",
+          "label": "本地目录路径",
+          "type": "text"
+        },
+        {
+          "key": "tmdbId",
+          "label": "TMDB ID",
+          "type": "text"
+        },
+        {
+          "key": "mediaType",
+          "label": "媒体类型",
+          "type": "text",
+          "default": "tv"
+        },
+        {
+          "key": "title",
+          "label": "作品名称",
+          "type": "text"
+        },
+        {
+          "key": "dirName",
+          "label": "目录名称",
+          "type": "text"
+        },
+        {
+          "key": "linkType",
+          "label": "链接类型",
+          "type": "text",
+          "default": "http"
+        }
+      ]
+    },
+    {
+      "id": "unprotect-item",
+      "label": "将选定作品移出保护组",
+      "fields": [
+        {
+          "key": "key",
+          "label": "保护条目主键",
+          "type": "text"
+        },
+        {
+          "key": "localPath",
+          "label": "本地目录路径",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "id": "check-protected-tmdb",
+      "label": "批量向 TMDB 查验保护组年份",
+      "fields": [
+        {
+          "key": "key",
+          "label": "保护条目主键",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "id": "collect-delete",
+      "label": "核对删除任务结果",
+      "kind": "continuation",
       "inputSchema": {
         "type": "object",
         "properties": {
-          "category": {
+          "key": {
             "type": "string"
           }
         },
-        "additionalProperties": true
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-organize",
+      "label": "核对整理任务结果",
+      "kind": "continuation",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "cleanup-snapshots",
+      "label": "回收24小时前的旧快照分片",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cursor": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "preview-mixed",
+      "label": "预览混合链接评分（不删除）",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tmdbId": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mediaType": {
+            "type": "string",
+            "enum": [
+              "movie",
+              "tv"
+            ]
+          },
+          "ruleId": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "tmdbId",
+          "mediaType",
+          "ruleId"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "cleanup-mixed",
+      "label": "按评分清理混合组败者文件",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tmdbId": {
+            "type": "string"
+          },
+          "mediaType": {
+            "type": "string",
+            "enum": [
+              "movie",
+              "tv"
+            ]
+          }
+        },
+        "required": [
+          "tmdbId",
+          "mediaType"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed",
+      "kind": "continuation",
+      "label": "核对混合组文件清理结果",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "batch-cleanup-mixed",
+      "label": "处理勾选混合组：清理败者并整理胜者",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "selectedGroups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "maxItems": 50
+          }
+        },
+        "required": [
+          "selectedGroups"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "resume-mixed",
+      "label": "核验并续接混合处理（不重发未知删除）",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "test-mt-mapping",
+      "label": "测试MT云盘映射（只读）",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
       },
       "outputSchema": {
         "type": "object",
@@ -121,69 +470,392 @@
       }
     },
     {
-      "id": "stop",
-      "label": "停止任务",
-      "fields": [],
+      "id": "save-root-bindings",
+      "label": "保存授权根绑定",
       "inputSchema": {
         "type": "object",
-        "additionalProperties": true
-      },
-      "outputSchema": {
-        "type": "object",
-        "additionalProperties": true
+        "properties": {
+          "bindingsJson": {
+            "type": "string",
+            "maxLength": 16000
+          }
+        },
+        "required": [
+          "bindingsJson"
+        ],
+        "additionalProperties": false
       }
     },
     {
-      "id": "clear-history",
-      "label": "清空扫描记录",
-      "fields": [],
+      "id": "collect-mixed-1",
+      "kind": "continuation",
+      "label": "核验混合流程第2阶段",
       "inputSchema": {
         "type": "object",
-        "additionalProperties": true
-      },
-      "outputSchema": {
-        "type": "object",
-        "additionalProperties": true
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
       }
     },
     {
-      "id": "save-config",
-      "label": "保存分流配置",
-      "fields": [],
+      "id": "collect-mixed-2",
+      "kind": "continuation",
+      "label": "核验混合流程第3阶段",
       "inputSchema": {
         "type": "object",
-        "additionalProperties": true
-      },
-      "outputSchema": {
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-3",
+      "kind": "continuation",
+      "label": "核验混合流程第4阶段",
+      "inputSchema": {
         "type": "object",
-        "additionalProperties": true
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-4",
+      "kind": "continuation",
+      "label": "核验混合流程第5阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-5",
+      "kind": "continuation",
+      "label": "核验混合流程第6阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-6",
+      "kind": "continuation",
+      "label": "核验混合流程第7阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-7",
+      "kind": "continuation",
+      "label": "核验混合流程第8阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-8",
+      "kind": "continuation",
+      "label": "核验混合流程第9阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-9",
+      "kind": "continuation",
+      "label": "核验混合流程第10阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-10",
+      "kind": "continuation",
+      "label": "核验混合流程第11阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-11",
+      "kind": "continuation",
+      "label": "核验混合流程第12阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-12",
+      "kind": "continuation",
+      "label": "核验混合流程第13阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-13",
+      "kind": "continuation",
+      "label": "核验混合流程第14阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-14",
+      "kind": "continuation",
+      "label": "核验混合流程第15阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-15",
+      "kind": "continuation",
+      "label": "核验混合流程第16阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-16",
+      "kind": "continuation",
+      "label": "核验混合流程第17阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-17",
+      "kind": "continuation",
+      "label": "核验混合流程第18阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-18",
+      "kind": "continuation",
+      "label": "核验混合流程第19阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "collect-mixed-19",
+      "kind": "continuation",
+      "label": "核验混合流程第20阶段",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
       }
     }
   ],
   "queries": [
     {
       "id": "status",
-      "label": "运行状态与统计",
-      "inputSchema": {
+      "label": "查重统计与结果状态",
+      "outputSchema": {
         "type": "object",
         "additionalProperties": true
       },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "share_links": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "local_links": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mixed_links": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "protected_links": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "profiles",
+      "label": "已授权整理方案列表",
       "outputSchema": {
         "type": "object",
         "additionalProperties": true
       }
     },
     {
-      "id": "profiles",
-      "label": "整理方案列表",
-      "inputSchema": {
-        "type": "object",
-        "additionalProperties": true
-      },
-      "outputSchema": {
-        "type": "object",
-        "additionalProperties": true
-      }
+      "id": "qualityrules",
+      "label": "质量评分规则列表"
+    },
+    {
+      "id": "authorizedroots",
+      "label": "当前可读授权根"
     }
   ],
   "ui": {

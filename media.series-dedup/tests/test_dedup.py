@@ -5,8 +5,8 @@ import unittest
 # 将插件目录加入路径
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from core.scanner import clean_title_invisible_chars, parse_media_dir, analyze_strm_files
-from core.matcher import evaluate_dir_match, match_duplicate_groups
+from series_core.scanner import clean_title_invisible_chars, parse_media_dir, analyze_strm_files
+from series_core.matcher import evaluate_dir_match, match_duplicate_groups
 
 class TestSeriesDedup(unittest.TestCase):
 
@@ -51,7 +51,7 @@ class TestSeriesDedup(unittest.TestCase):
         is_matched, need_org, diff = evaluate_dir_match(item, "凡人修仙传", 2020)
         self.assertFalse(is_matched)
         self.assertTrue(need_org)
-        self.assertIn("片名不符", diff)
+        self.assertIn("片名不一致", diff)
 
     def test_evaluate_dir_match_diff_year(self):
         item = {

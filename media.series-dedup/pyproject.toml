@@ -1,7 +1,7 @@
 [project]
-name = "media.series-dedup"
-version = "1.0.0"
-description = "剧集查重（影视目录重整分流）"
+name = "media-series-dedup"
+version = "1.4.12"
+description = "影视查重（影视目录多版本比对与分流重整）"
 requires-python = ">=3.12,<3.13"
 dependencies = []
 
@@ -14,6 +14,6 @@ include = [
   "plugin.json",
   "pyproject.toml",
   "uv.lock",
-  "core",
+  "series_core",
   "ui"
 ]

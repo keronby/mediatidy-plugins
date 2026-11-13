@@ -3,6 +3,6 @@ revision = 1
 requires-python = "==3.12.*"
 
 [[package]]
-name = "media.series-dedup"
-version = "1.0.0"
+name = "media-series-dedup"
+version = "1.4.12"
 source = { virtual = "." }
